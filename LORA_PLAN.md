@@ -370,4 +370,37 @@ fires only on the latter.
 
 64/64 tests pass (`PYTHONPATH=src python3 -m unittest discover -s tests/lora`).
 
-### Phases 2-4 (performance dedup, SF/BW auto-detect, table UI): not yet started
+### Phase 2: performance dedup -- DONE
+
+Split `decode_frame` into `_locate_frame` (find_frame_start + CFO-iteration --
+depends on `n_preamble` but not `sync_word`) and `_decode_located_frame`
+(sync-word check + header + payload decode -- the part that depends on
+`sync_word`). `decode_frame` itself is now a thin wrapper preserving its exact
+prior signature/return dict, so all pre-existing tests pass unmodified
+(behavior-preserving refactor, verified by the full suite staying green).
+
+`scan_chunk_for_frames` now loops `n_preamble` outer (calling `_locate_frame`
+once, catching `LoRaSyncError` once) and `sync_word` inner (calling
+`_decode_located_frame` against the already-located/CFO-corrected IQ) --
+eliminates the redundant re-location work every `(n_preamble, sync_word)` pair
+previously did independently. Also cached `reference_upchirp`/
+`reference_downchirp` in `lora_chirp.py` via `functools.lru_cache` (verified no
+caller mutates the returned array in place -- all usages multiply against it,
+which allocates a new array).
+
+Measured with a micro-benchmark (`tmp_scripts/bench_scan_chunk.py`, not
+committed as a test) on a representative chunk with the default 2 n_preamble x
+2 sync_word sweep: 284ms/call before -> 143ms/call after, ~2x, matching the
+expected reduction from eliminating the sync_word fan-out redundancy.
+
+New regression test (`test_lora_scan.py`): asserts `_locate_frame` is called
+exactly `len(n_preamble_options)` times (not `x len(sync_word_options)`) per
+chunk via `unittest.mock.patch` call-counting.
+
+65/65 tests pass.
+
+Cython porting of the hot `_dechirp_fft` inner loop remains explicitly out of
+scope (per the approved plan) -- only worth pursuing if a future real-capture
+pass shows scan latency is still a problem after this dedup.
+
+### Phases 3-4 (SF/BW auto-detect, table UI): not yet started

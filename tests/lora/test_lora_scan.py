@@ -1,8 +1,10 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 
-from urh.lora.lora_demod import scan_for_frames
+from urh.lora import lora_demod
+from urh.lora.lora_demod import scan_for_frames, scan_chunk_for_frames
 from urh.lora.lora_modulator import build_frame
 
 
@@ -78,6 +80,28 @@ class TestScanForFrames(unittest.TestCase):
         hits, max_mags = scan_for_frames(noise, 8, 125000.0, 125000.0, chunk_sec=0.05)
         self.assertEqual(hits, [])
         self.assertTrue(len(max_mags) > 1)
+
+
+class TestScanChunkDedupesLocation(unittest.TestCase):
+    def test_locate_frame_called_once_per_n_preamble_not_per_sync_word(self):
+        """Performance regression guard: sync_word doesn't affect frame
+        location, only the post-location sync-word-symbol comparison, so
+        _locate_frame (the expensive find_frame_start + CFO-iteration work)
+        should run once per n_preamble value, not once per
+        (n_preamble, sync_word) combination."""
+        rng = np.random.default_rng(11)
+        sf, bw = 8, 125000.0
+        frame = build_frame(b"dedup test", sf, bw, cr=4)
+        capture = frame + (rng.standard_normal(len(frame)) + 1j * rng.standard_normal(len(frame))) * 0.05
+
+        n_preamble_options = (8, 16)
+        sync_word_options = (0x34, 0x12, 0x99)
+
+        with mock.patch(
+            "urh.lora.lora_demod._locate_frame", wraps=lora_demod._locate_frame
+        ) as spy:
+            scan_chunk_for_frames(capture, sf, bw, bw, n_preamble_options, sync_word_options)
+            self.assertEqual(spy.call_count, len(n_preamble_options))
 
 
 if __name__ == "__main__":

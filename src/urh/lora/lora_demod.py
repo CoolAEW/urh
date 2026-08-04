@@ -344,31 +344,17 @@ def _symbol_entropy_score(symbols, sf):
     return entropy / max_entropy if max_entropy > 0 else 1.0
 
 
-def decode_frame(
-    iq,
-    sf,
-    bw,
-    fs=None,
-    n_preamble=DEFAULT_N_PREAMBLE,
-    sync_word=DEFAULT_SYNC_WORD,
-    correct_cfo=True,
-):
-    """Full receive chain: locate frame, decode header, decode payload.
+def _locate_frame(iq, sf, bw, fs, n_preamble, correct_cfo=True):
+    """Find the frame and (optionally) estimate/apply CFO correction --
+    everything decode_frame needs that depends on n_preamble but *not* on
+    sync_word. Split out so callers trying multiple sync_word candidates
+    against the same n_preamble (see scan_chunk_for_frames) can do this
+    expensive part -- find_frame_start is an O(L log L) FFT-based matched
+    filter over the whole chunk, and CFO correction re-runs it up to 3x --
+    exactly once instead of once per sync_word.
 
-    Returns a dict: {payload: bytes, cr: int, uncorrectable_errors: int,
-    sync_ok: bool, header_start: int, cfo_hz: float, confidence: float,
-    payload_truncated: bool, truncated_at_symbol: int or None}.
-
-    If real signal ends partway through the payload (trailing noise/silence
-    after a genuinely short transmission), that trailing region is detected
-    via a sustained drop in per-symbol peakiness relative to the header and
-    the payload is *truncated* to what decoded before the collapse rather
-    than either trusting clearly-bogus trailing bytes or discarding an
-    otherwise-correct partial decode outright -- see PAYLOAD_COLLAPSE_*.
+    Returns (corrected_iq, preamble_start, header_start, cfo_hz).
     """
-    if fs is None:
-        fs = bw
-
     preamble_start, header_start = find_frame_start(iq, sf, bw, fs, n_preamble)
 
     cfo_hz = 0.0
@@ -392,6 +378,16 @@ def decode_frame(
             cfo_hz += step_hz
             preamble_start, header_start = find_frame_start(iq, sf, bw, fs, n_preamble)
 
+    return iq, preamble_start, header_start, cfo_hz
+
+
+def _decode_located_frame(iq, sf, bw, fs, preamble_start, header_start, n_preamble, sync_word, cfo_hz=0.0):
+    """Decode header+payload from an already-located (and, if applicable,
+    already CFO-corrected) frame -- the part of decode_frame that actually
+    depends on sync_word. See _locate_frame for the part that doesn't.
+
+    Returns the same result dict decode_frame does.
+    """
     # sanity-check the sync word symbols (informational, not fatal)
     n_sym = chirp.samples_per_symbol(sf, bw, fs)
     sync_offset = preamble_start + n_preamble * n_sym
@@ -489,18 +485,71 @@ def decode_frame(
     }
 
 
+def decode_frame(
+    iq,
+    sf,
+    bw,
+    fs=None,
+    n_preamble=DEFAULT_N_PREAMBLE,
+    sync_word=DEFAULT_SYNC_WORD,
+    correct_cfo=True,
+):
+    """Full receive chain: locate frame, decode header, decode payload.
+
+    Returns a dict: {payload: bytes, cr: int, uncorrectable_errors: int,
+    sync_ok: bool, header_start: int, cfo_hz: float, confidence: float,
+    payload_truncated: bool, truncated_at_symbol: int or None}.
+
+    If real signal ends partway through the payload (trailing noise/silence
+    after a genuinely short transmission), that trailing region is detected
+    via a sustained drop in per-symbol peakiness relative to the header and
+    the payload is *truncated* to what decoded before the collapse rather
+    than either trusting clearly-bogus trailing bytes or discarding an
+    otherwise-correct partial decode outright -- see PAYLOAD_COLLAPSE_*.
+
+    A thin wrapper over _locate_frame + _decode_located_frame -- kept as a
+    single call for simple single-sync-word use (and to keep this exact
+    signature/return-dict stable for existing callers/tests); callers
+    trying multiple sync_word candidates against the same n_preamble should
+    call _locate_frame once and _decode_located_frame per candidate
+    themselves instead, to avoid repeating the expensive location/CFO work
+    -- see scan_chunk_for_frames.
+    """
+    if fs is None:
+        fs = bw
+    iq, preamble_start, header_start, cfo_hz = _locate_frame(
+        iq, sf, bw, fs, n_preamble, correct_cfo=correct_cfo
+    )
+    return _decode_located_frame(
+        iq, sf, bw, fs, preamble_start, header_start, n_preamble, sync_word, cfo_hz=cfo_hz
+    )
+
+
 def scan_chunk_for_frames(iq_chunk, sf, bw, fs, n_preamble_options, sync_word_options):
     """Try every (n_preamble, sync_word) combination against one chunk of IQ
     samples. Returns a list of decode_frame result dicts for every attempt
     that found *a* frame-sync trigger (not necessarily sync_ok=True -- callers
     decide what to trust), each annotated with the n_preamble/sync_word used.
+
+    For each n_preamble, the expensive frame-location/CFO-correction work
+    (_locate_frame) runs exactly once and is reused across every sync_word
+    candidate, rather than once per (n_preamble, sync_word) pair -- sync_word
+    only affects the sync-word-symbol comparison *after* the frame is already
+    located, so re-running location per sync_word (as a naive per-combo call
+    to decode_frame would) is pure waste.
     """
     hits = []
     for n_preamble in n_preamble_options:
+        try:
+            iq, preamble_start, header_start, cfo_hz = _locate_frame(
+                iq_chunk, sf, bw, fs, n_preamble
+            )
+        except LoRaSyncError:
+            continue
         for sync_word in sync_word_options:
             try:
-                result = decode_frame(
-                    iq_chunk, sf, bw, fs=fs, n_preamble=n_preamble, sync_word=sync_word
+                result = _decode_located_frame(
+                    iq, sf, bw, fs, preamble_start, header_start, n_preamble, sync_word, cfo_hz=cfo_hz
                 )
             except LoRaSyncError:
                 continue
