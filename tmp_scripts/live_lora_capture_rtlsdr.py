@@ -56,24 +56,47 @@ def record(center_freq, duration_sec, out_path, sample_rate=1_024_000,
         bytes_written = 0
         start = time.time()
         last_report = start
+        # Hard wall-clock backstop: never run more than 3x the requested
+        # duration (+10s) regardless of read progress, so a stalled/starved
+        # USB stream can't spin forever like it did on the first attempt.
+        deadline = start + max(duration_sec * 3, duration_sec + 10)
+        consecutive_empty_reads = 0
+        max_consecutive_empty_reads = 200  # ~a few seconds of dead air, not a hang
 
         with open(out_path, "wb") as f:
             samples_read = 0
             while samples_read < total_samples_needed:
+                now = time.time()
+                if now >= deadline:
+                    print(f"WARNING: hit {duration_sec*3:.0f}s wall-clock deadline "
+                          f"with only {samples_read}/{total_samples_needed} samples "
+                          f"read -- stream appears stalled, aborting early.", flush=True)
+                    break
+
                 remaining = total_samples_needed - samples_read
                 n = min(read_chunk_samples, remaining)
                 data = rtlsdr.read_sync(n)
+
+                if len(data) == 0:
+                    consecutive_empty_reads += 1
+                    if consecutive_empty_reads >= max_consecutive_empty_reads:
+                        print(f"WARNING: {consecutive_empty_reads} consecutive empty "
+                              f"reads -- stream appears stalled, aborting early.", flush=True)
+                        break
+                    continue
+                consecutive_empty_reads = 0
+
                 f.write(data)
                 bytes_written += len(data)
                 samples_read += len(data) // 2  # 2 bytes (I, Q) per IQ sample
 
-                now = time.time()
                 if now - last_report > 10:
                     print(f"  ...{now - start:.0f}s elapsed, {bytes_written / 1e6:.1f} MB written",
                           flush=True)
                     last_report = now
 
-        print(f"recording done: {bytes_written / 1e6:.1f} MB written to {out_path}", flush=True)
+        print(f"recording done: {bytes_written / 1e6:.1f} MB written to {out_path} "
+              f"({samples_read}/{total_samples_needed} samples requested)", flush=True)
         return bytes_written
     finally:
         try:
