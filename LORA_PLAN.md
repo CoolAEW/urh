@@ -105,7 +105,19 @@ later, not a blocker for building and self-testing the decoder now.
       random SF/CR/payload; a 720-case stress grid (SF7-12, BW 125k/500k,
       OSR1/2/4, CR1-4, payload up to 255 bytes) -- all pass, ~4 min runtime.
       17/17 unit tests pass (`python3 -m unittest discover -s tests/lora -v`).
-- [ ] Stage 5 -- UI wiring (`LoRaDecoderDialog` + menu entry). In progress.
+- [x] Stage 5 -- UI wiring. `src/urh/controller/dialogs/LoRaDecoderDialog.py`:
+      plain QDialog (no .ui file), takes the currently-loaded Signal's raw IQ
+      + user-entered SF/BW/preamble-length/sync-word, runs `decode_frame`,
+      shows hex + best-effort ASCII, sync/FEC-error status. Wired into
+      `MainController` as "LoRa Decoder..." in the File menu (built and
+      inserted in Python code next to `setupUi()`, not added to the .ui
+      source, to keep the change additive and not require regenerating
+      `ui_main.py`). Smoke-tested end-to-end: constructed a real `Signal` +
+      `IQArray` from a synthetic frame, drove the dialog's own decode
+      handler, confirmed correct payload/hex/ASCII output through the actual
+      UI code path (not just the underlying urh.lora functions). Also
+      confirmed `MainController` still constructs cleanly with the new menu
+      action present.
 
 Known simplification (documented, not a bug): the header/payload coding here
 is a self-consistent from-scratch implementation of the documented LoRa PHY

@@ -19,6 +19,7 @@ from urh.controller.SignalTabController import SignalTabController
 from urh.controller.SimulatorTabController import SimulatorTabController
 from urh.controller.dialogs.CSVImportDialog import CSVImportDialog
 from urh.controller.dialogs.DecoderDialog import DecoderDialog
+from urh.controller.dialogs.LoRaDecoderDialog import LoRaDecoderDialog
 from urh.controller.dialogs.OptionsDialog import OptionsDialog
 from urh.controller.dialogs.ProjectDialog import ProjectDialog
 from urh.controller.dialogs.ProtocolSniffDialog import ProtocolSniffDialog
@@ -44,6 +45,13 @@ class MainController(QMainWindow):
         super().__init__(*args)
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+
+        # Additive feature, not present in the .ui source: built and inserted
+        # here in code rather than touching the generated ui_main.py.
+        self.ui.actionLoRa_Decoder = QAction(self.tr("LoRa Decoder..."), self)
+        self.ui.menuFile.insertAction(
+            self.ui.actionRecord, self.ui.actionLoRa_Decoder
+        )
 
         util.set_splitter_stylesheet(self.ui.splitter)
 
@@ -248,6 +256,9 @@ class MainController(QMainWindow):
         self.ui.actionDecoding.triggered.connect(self.on_show_decoding_dialog_triggered)
         self.ui.actionSpectrum_Analyzer.triggered.connect(
             self.on_show_spectrum_dialog_action_triggered
+        )
+        self.ui.actionLoRa_Decoder.triggered.connect(
+            self.on_show_lora_decoder_dialog_action_triggered
         )
         self.ui.actionOptions.triggered.connect(
             self.show_options_dialog_action_triggered
@@ -953,6 +964,18 @@ class MainController(QMainWindow):
 
         r.device_parameters_changed.connect(pm.set_device_parameters)
         r.show()
+
+    @pyqtSlot()
+    def on_show_lora_decoder_dialog_action_triggered(self):
+        frames = self.signal_tab_controller.signal_frames
+        if not frames:
+            Errors.generic_error(
+                self.tr("No signal loaded"),
+                self.tr("Load a signal (File -> Open) before opening the LoRa decoder."),
+            )
+            return
+        dialog = LoRaDecoderDialog(frames[0].signal, parent=self)
+        dialog.show()
 
     @pyqtSlot(list)
     def on_signals_recorded(self, recorded_files: list):
