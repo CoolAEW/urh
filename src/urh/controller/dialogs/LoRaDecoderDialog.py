@@ -6,9 +6,14 @@ decoded payload as hex + best-effort ASCII. This is intentionally built
 without a .ui file (plain QDialog + code-built layout) to keep it additive
 and self-contained -- see LORA_PLAN.md for why LoRa doesn't fit the existing
 Signal/Modulator pipeline.
+
+Scanning runs on a QThread with chunk-level progress reporting (via
+lora_demod.scan_for_frames), since a signal can be many minutes of IQ and a
+single blocking FFT over the whole thing would freeze the UI with no
+feedback for a long time.
 """
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -17,14 +22,51 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPlainTextEdit,
+    QProgressBar,
     QSpinBox,
     QVBoxLayout,
 )
 
-from urh.lora.lora_demod import decode_frame, LoRaSyncError
+from urh.lora.lora_demod import scan_for_frames
 from urh.lora.lora_frame_format import DEFAULT_N_PREAMBLE, DEFAULT_SYNC_WORD
 from urh.lora.protocols import identify
 from urh.signalprocessing.Signal import Signal
+
+
+class _ScanWorker(QThread):
+    progress = pyqtSignal(int, int, float)  # chunk_idx, total_chunks, offset_sec
+    finished_ok = pyqtSignal(list, list)  # hits, max_mags
+    failed = pyqtSignal(str)
+
+    def __init__(self, iq, sf, bw, fs, n_preamble, sync_word, parent=None):
+        super().__init__(parent)
+        self.iq = iq
+        self.sf = sf
+        self.bw = bw
+        self.fs = fs
+        self.n_preamble = n_preamble
+        self.sync_word = sync_word
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        try:
+            hits, max_mags = scan_for_frames(
+                self.iq,
+                self.sf,
+                self.bw,
+                self.fs,
+                n_preamble_options=(self.n_preamble,),
+                sync_word_options=(self.sync_word,),
+                progress_cb=lambda i, total, t: self.progress.emit(i, total, t),
+                should_stop=lambda: self._stop_requested,
+            )
+        except Exception as e:
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit(hits, max_mags)
 
 
 class LoRaDecoderDialog(QDialog):
@@ -44,6 +86,7 @@ class LoRaDecoderDialog(QDialog):
     def __init__(self, signal: Signal, parent=None):
         super().__init__(parent)
         self.signal = signal
+        self.worker = None
         self.setWindowTitle(self.tr("LoRa Decoder"))
         self.setMinimumWidth(480)
 
@@ -85,6 +128,14 @@ class LoRaDecoderDialog(QDialog):
         form.addRow(self.tr("Sync word (hex):"), self.sync_word_edit)
         form.addRow(self.tr("Signal sample rate:"), self.sample_rate_label)
 
+        self.status_label = QLabel(self)
+        self.status_label.setText(self.tr("Idle."))
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+
         self.result_view = QPlainTextEdit(self)
         self.result_view.setReadOnly(True)
         self.result_view.setPlaceholderText(
@@ -96,15 +147,22 @@ class LoRaDecoderDialog(QDialog):
         self.decode_button = self.button_box.addButton(
             self.tr("Decode"), QDialogButtonBox.ButtonRole.ActionRole
         )
+        self.cancel_button = self.button_box.addButton(
+            self.tr("Cancel"), QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.cancel_button.setEnabled(False)
         self.close_button = self.button_box.addButton(QDialogButtonBox.StandardButton.Close)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.progress_bar)
         layout.addWidget(self.result_view)
         layout.addWidget(self.button_box)
         self.setLayout(layout)
 
         self.decode_button.clicked.connect(self.on_decode_clicked)
+        self.cancel_button.clicked.connect(self.on_cancel_clicked)
         self.close_button.clicked.connect(self.close)
 
     @staticmethod
@@ -126,6 +184,24 @@ class LoRaDecoderDialog(QDialog):
         text = self.sync_word_edit.text().strip()
         return int(text, 16) if text.lower().startswith("0x") else int(text, 16)
 
+    def closeEvent(self, event):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.request_stop()
+            self.worker.wait(5000)
+        super().closeEvent(event)
+
+    def _set_running(self, running: bool):
+        self.decode_button.setEnabled(not running)
+        self.cancel_button.setEnabled(running)
+        for w in (self.sf_spinbox, self.bw_combobox, self.cr_combobox,
+                  self.n_preamble_spinbox, self.sync_word_edit):
+            w.setEnabled(not running)
+
+    def on_cancel_clicked(self):
+        if self.worker is not None:
+            self.status_label.setText(self.tr("Cancelling..."))
+            self.worker.request_stop()
+
     def on_decode_clicked(self):
         if self.signal is None:
             self.result_view.setPlainText(self.tr("No signal loaded."))
@@ -144,19 +220,64 @@ class LoRaDecoderDialog(QDialog):
 
         iq = self.signal.iq_array.as_complex64()
 
-        try:
-            result = decode_frame(
-                iq, sf, bw, fs=fs, n_preamble=n_preamble, sync_word=sync_word
+        self.result_view.setPlainText("")
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.status_label.setText(self.tr("Scanning..."))
+        self._set_running(True)
+
+        self.worker = _ScanWorker(iq, sf, bw, fs, n_preamble, sync_word, parent=self)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.finished_ok.connect(self._on_scan_finished)
+        self.worker.failed.connect(self._on_scan_failed)
+        self.worker.finished.connect(lambda: self._set_running(False))
+        self.worker.start()
+
+    def _on_progress(self, chunk_idx, total_chunks, offset_sec):
+        self.progress_bar.setRange(0, max(1, total_chunks))
+        self.progress_bar.setValue(chunk_idx + 1)
+        self.status_label.setText(
+            self.tr("Scanning chunk {0}/{1} (t={2:.1f}s)...").format(
+                chunk_idx + 1, total_chunks, offset_sec
             )
-        except LoRaSyncError as e:
-            self.result_view.setPlainText(self.tr("No LoRa frame found: ") + str(e))
-            return
-        except Exception as e:
-            self.result_view.setPlainText(self.tr("Decode error: ") + str(e))
+        )
+
+    def _on_scan_failed(self, message):
+        self.status_label.setText(self.tr("Error."))
+        self.result_view.setPlainText(self.tr("Decode error: ") + message)
+
+    def _on_scan_finished(self, hits, max_mags):
+        sf = self.sf_spinbox.value()
+        bw = float(self._selected_bandwidth())
+
+        if not hits:
+            self.status_label.setText(self.tr("Done -- no frame found."))
+            peak = max(max_mags) if max_mags else 0.0
+            self.result_view.setPlainText(
+                self.tr("No LoRa frame found in this signal.\n\n"
+                        "Peak |IQ| magnitude observed: {0:.4f} "
+                        "(near/above 1.0 suggests clipping; near 0 suggests "
+                        "no signal energy at this frequency/bandwidth).").format(peak)
+            )
             return
 
-        id_result = identify.identify(result["payload"], sf=sf, bw=bw)
-        self.result_view.setPlainText(self._format_result(result, id_result))
+        # Prefer a confirmed sync; among those (or if none), prefer fewer
+        # FEC errors -- both are "closer to a real frame" signals.
+        hits.sort(key=lambda h: (not h["sync_ok"], h["uncorrectable_errors"]))
+
+        self.status_label.setText(
+            self.tr("Done -- {0} candidate(s) found.").format(len(hits))
+        )
+        blocks = []
+        for h in hits:
+            id_result = identify.identify(h["payload"], sf=sf, bw=bw)
+            blocks.append(
+                f"--- t={h['chunk_offset_samples'] / float(self.signal.sample_rate):.1f}s "
+                f"(chunk {h['chunk_idx']}, n_preamble={h['n_preamble']}, "
+                f"sync=0x{h['sync_word']:02X}) ---\n"
+                + self._format_result(h, id_result)
+            )
+        self.result_view.setPlainText("\n\n".join(blocks))
 
     @staticmethod
     def _format_result(result, id_result):

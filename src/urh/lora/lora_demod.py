@@ -210,3 +210,83 @@ def decode_frame(
         "preamble_start": preamble_start,
         "header_start": header_start,
     }
+
+
+def scan_chunk_for_frames(iq_chunk, sf, bw, fs, n_preamble_options, sync_word_options):
+    """Try every (n_preamble, sync_word) combination against one chunk of IQ
+    samples. Returns a list of decode_frame result dicts for every attempt
+    that found *a* frame-sync trigger (not necessarily sync_ok=True -- callers
+    decide what to trust), each annotated with the n_preamble/sync_word used.
+    """
+    hits = []
+    for n_preamble in n_preamble_options:
+        for sync_word in sync_word_options:
+            try:
+                result = decode_frame(
+                    iq_chunk, sf, bw, fs=fs, n_preamble=n_preamble, sync_word=sync_word
+                )
+            except LoRaSyncError:
+                continue
+            result["n_preamble"] = n_preamble
+            result["sync_word"] = sync_word
+            hits.append(result)
+    return hits
+
+
+def scan_for_frames(
+    iq,
+    sf,
+    bw,
+    fs,
+    n_preamble_options=(DEFAULT_N_PREAMBLE,),
+    sync_word_options=(DEFAULT_SYNC_WORD,),
+    chunk_sec=3.0,
+    overlap_sec=0.5,
+    progress_cb=None,
+    should_stop=None,
+):
+    """Chunked scan of a (possibly long) in-memory IQ array for a LoRa frame,
+    avoiding one huge FFT over the whole capture -- impractical at multi-
+    minute captures, and gives no opportunity to report progress or cancel.
+
+    Calls progress_cb(chunk_idx, total_chunks, chunk_offset_sec) between
+    chunks if given. Calls should_stop() between chunks if given and stops
+    early if it returns True.
+
+    Returns (hits, max_mags): hits is a list of decode_frame result dicts
+    (each also carrying chunk_idx/chunk_offset_samples/n_preamble/sync_word),
+    max_mags is the per-chunk peak |iq| magnitude -- useful for telling "no
+    signal present" apart from "signal present but wouldn't sync".
+    """
+    chunk_samples = max(1, int(chunk_sec * fs))
+    overlap_samples = int(overlap_sec * fs)
+    step = max(1, chunk_samples - overlap_samples)
+    total_samples = len(iq)
+    total_chunks = max(1, -(-total_samples // step))  # ceil div
+
+    hits = []
+    max_mags = []
+    offset = 0
+    chunk_idx = 0
+    while offset < total_samples:
+        if should_stop is not None and should_stop():
+            break
+        chunk = iq[offset : offset + chunk_samples]
+        if len(chunk) == 0:
+            break
+        max_mags.append(float(np.max(np.abs(chunk))))
+
+        for result in scan_chunk_for_frames(
+            chunk, sf, bw, fs, n_preamble_options, sync_word_options
+        ):
+            result["chunk_idx"] = chunk_idx
+            result["chunk_offset_samples"] = offset
+            hits.append(result)
+
+        if progress_cb is not None:
+            progress_cb(chunk_idx, total_chunks, offset / fs)
+
+        offset += step
+        chunk_idx += 1
+
+    return hits, max_mags
