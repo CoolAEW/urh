@@ -19,12 +19,20 @@ class LoRaSyncError(Exception):
     """Raised when no valid preamble/SFD could be located in the capture."""
 
 
+def _dechirp_fft(window, sf, bw, fs, downchirp_ref=None):
+    """Dechirp one symbol-length window against the reference downchirp and
+    return the first 2**sf complex FFT bins. Magnitude-argmax over this is
+    the demodulated symbol value; the complex value at a given bin (not just
+    its magnitude) is also used for fine CFO phase estimation."""
+    n = 1 << sf
+    down = downchirp_ref if downchirp_ref is not None else chirp.reference_downchirp(sf, bw, fs)
+    y = window * down
+    return np.fft.fft(y)[:n]
+
+
 def demod_symbol(window, sf, bw, fs):
     """Dechirp one symbol-length window and return the peak FFT bin (0..2**sf-1)."""
-    n = 1 << sf
-    down = chirp.reference_downchirp(sf, bw, fs)
-    y = window * down
-    mag = np.abs(np.fft.fft(y))[:n]
+    mag = np.abs(_dechirp_fft(window, sf, bw, fs))
     return int(np.argmax(mag))
 
 
@@ -120,6 +128,85 @@ def find_frame_start(
     return preamble_start, header_start
 
 
+def estimate_cfo_hz(iq, preamble_start, n_preamble, sf, bw, fs):
+    """Estimate carrier frequency offset (CFO) from the preamble's repeated
+    symbol-0 upchirps, in two stages:
+
+    Coarse (integer bin): with a CFO, every preamble upchirp dechirps to the
+    same nonzero bin B (mod 2**sf) instead of bin 0. Take the bin most
+    preamble symbols agree on. B > 2**(sf-1) is treated as a negative offset
+    (aliased the other way), the usual convention for a symmetric range.
+
+    Fine (sub-bin): a coarse bin estimate alone leaves up to +/-0.5 bin of
+    residual error, which spreads FFT energy across adjacent bins rather
+    than concentrating it -- this shows up as a *phase rotation* between
+    consecutive identical preamble symbols at the coarse bin. Average that
+    phase difference and convert to Hz. This step is only reliable once
+    coarse correction has narrowed things to within one bin: phase-only
+    estimation between two symbols is inherently ambiguous (aliased) for
+    offsets larger than +/-0.5 cycle per symbol period.
+
+    A real CFO also shifts *where in time* a chirp matched filter's peak
+    lands (the chirp-radar "range-Doppler coupling" effect), so the given
+    preamble_start -- typically from find_frame_start on the *uncorrected*
+    signal -- can be off by a handful of samples whenever a real CFO is
+    present, which in turn can make a single estimate pass here inaccurate.
+    This function does not compensate for that itself (an ad-hoc local
+    search over nearby sample offsets turned out to overfit noise and was
+    worse than not searching at all); callers wanting an accurate estimate
+    under a potentially-large CFO should call this, correct, re-locate the
+    frame with find_frame_start on the corrected signal, and repeat until
+    the estimate stops changing much -- see decode_frame's correct_cfo
+    handling, which iterates for exactly this reason.
+
+    Returns the estimated offset in Hz (positive = signal appears shifted
+    up in frequency; caller should derotate by -f_est to correct it).
+    """
+    n = 1 << sf
+    n_sym = chirp.samples_per_symbol(sf, bw, fs)
+    down = chirp.reference_downchirp(sf, bw, fs)
+
+    fft_per_symbol = []
+    for i in range(n_preamble):
+        start = preamble_start + i * n_sym
+        window = iq[start : start + n_sym]
+        if len(window) < n_sym:
+            break
+        fft_per_symbol.append(_dechirp_fft(window, sf, bw, fs, downchirp_ref=down))
+
+    if not fft_per_symbol:
+        return 0.0
+
+    bins = [int(np.argmax(np.abs(fft_vals))) for fft_vals in fft_per_symbol]
+    values, counts = np.unique(bins, return_counts=True)
+    b_coarse = int(values[np.argmax(counts)])
+    b_signed = b_coarse if b_coarse <= n // 2 else b_coarse - n
+    bin_width_hz = bw / n
+    coarse_hz = b_signed * bin_width_hz
+
+    vals_at_coarse_bin = [fft_vals[b_coarse] for fft_vals in fft_per_symbol]
+    sym_period = n_sym / fs
+    phase_diffs = [
+        np.angle(np.conj(vals_at_coarse_bin[i]) * vals_at_coarse_bin[i + 1])
+        for i in range(len(vals_at_coarse_bin) - 1)
+    ]
+    fine_hz = (float(np.mean(phase_diffs)) / (2 * np.pi) / sym_period) if phase_diffs else 0.0
+
+    return coarse_hz + fine_hz
+
+
+def apply_cfo_correction(iq, f_offset_hz, fs, start=0):
+    """Derotate iq[start:] by -f_offset_hz (a no-op copy if f_offset_hz==0),
+    using each sample's true absolute index for the time base so phase stays
+    continuous across the correction boundary. Returns a new array; leaves
+    the original untouched."""
+    if f_offset_hz == 0.0:
+        return iq
+    n = np.arange(start, len(iq))
+    rotation = np.exp(-1j * 2 * np.pi * f_offset_hz * n / fs).astype(iq.dtype)
+    return np.concatenate([iq[:start], iq[start:] * rotation])
+
+
 def _demod_symbols(iq, offset, count, sf, bw, fs):
     n_sym = chirp.samples_per_symbol(sf, bw, fs)
     if offset + count * n_sym > len(iq):
@@ -156,16 +243,38 @@ def decode_frame(
     fs=None,
     n_preamble=DEFAULT_N_PREAMBLE,
     sync_word=DEFAULT_SYNC_WORD,
+    correct_cfo=True,
 ):
     """Full receive chain: locate frame, decode header, decode payload.
 
     Returns a dict: {payload: bytes, cr: int, uncorrectable_errors: int,
-    sync_ok: bool, header_start: int}.
+    sync_ok: bool, header_start: int, cfo_hz: float}.
     """
     if fs is None:
         fs = bw
 
     preamble_start, header_start = find_frame_start(iq, sf, bw, fs, n_preamble)
+
+    cfo_hz = 0.0
+    if correct_cfo:
+        # Iterate estimate -> correct -> re-locate rather than a single
+        # pass: a CFO couples into the matched filter's peak *time* for a
+        # chirp signal (the chirp-radar "range-Doppler coupling" effect --
+        # an uncorrected offset shifts where the correlation peak lands),
+        # so preamble_start computed on the *uncorrected* signal can be off
+        # by a handful of samples, which in turn makes the first CFO
+        # estimate inaccurate. Each correction pass removes most of the
+        # remaining offset, which sharpens the next re-located
+        # preamble_start, which sharpens the next estimate -- converges in
+        # a couple of rounds rather than needing to get it exactly right in
+        # one shot.
+        for _ in range(3):
+            step_hz = estimate_cfo_hz(iq, preamble_start, n_preamble, sf, bw, fs)
+            if step_hz == 0.0:
+                break
+            iq = apply_cfo_correction(iq, step_hz, fs, start=0)
+            cfo_hz += step_hz
+            preamble_start, header_start = find_frame_start(iq, sf, bw, fs, n_preamble)
 
     # sanity-check the sync word symbols (informational, not fatal)
     n_sym = chirp.samples_per_symbol(sf, bw, fs)
@@ -212,6 +321,7 @@ def decode_frame(
         "sync_ok": sync_ok,
         "preamble_start": preamble_start,
         "header_start": header_start,
+        "cfo_hz": cfo_hz,
     }
 
 
