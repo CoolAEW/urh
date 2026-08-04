@@ -82,4 +82,42 @@ against a known LoRa device — flagged as a manual verification step for
 later, not a blocker for building and self-testing the decoder now.
 
 ## Status
-Research/scoping complete. Implementation starts at stage 1.
+
+- [x] Stage 1 -- synthetic modulator (`src/urh/lora/lora_modulator.py`)
+- [x] Stage 2 -- core symbol demod (`lora_chirp.py` + `lora_demod.demod_symbol`);
+      round-trips exactly across SF 7-12, OSR 1/2/4 (`tests/lora/test_lora_chirp.py`)
+- [x] Stage 3 -- frame sync (`lora_demod.find_frame_start`). Originally a
+      per-sample brute-force fine search, which was correct but O(n_sym) FFTs
+      per candidate -- impractically slow for large SF/OSR. Replaced with a
+      single FFT-based matched filter against the reference upchirp (O(L log L)
+      total). Also fixed two real bugs found via testing: (1) the coarse
+      autocorrelation stage normalized by one window's energy instead of
+      sqrt(E_A*E_B), letting low-energy noise windows produce correlation >1
+      and false-positive ahead of the real preamble; (2) "peakiness" as
+      peak/sum-of-bins silently gets harder to clear at higher SF for no
+      detection-quality reason, since bin count grows with SF -- switched to
+      peak/median, which is SF-independent (empirically: noise floor ~3.2-3.5,
+      real signal >=14 even at 0dB SNR / SF7).
+- [x] Stage 4 -- full payload recovery (header parse, Gray/interleave/Hamming/
+      dewhiten). `tests/lora/test_lora_frame_roundtrip.py`: clean round trip
+      across all SF(7-12) x CR(1-4) x payload-length combos; noisy (20dB SNR)
+      + random-offset round trip across SF x OSR(1/4) x CR; a fuzz test with
+      random SF/CR/payload; a 720-case stress grid (SF7-12, BW 125k/500k,
+      OSR1/2/4, CR1-4, payload up to 255 bytes) -- all pass, ~4 min runtime.
+      17/17 unit tests pass (`python3 -m unittest discover -s tests/lora -v`).
+- [ ] Stage 5 -- UI wiring (`LoRaDecoderDialog` + menu entry). In progress.
+
+Known simplification (documented, not a bug): the header/payload coding here
+is a self-consistent from-scratch implementation of the documented LoRa PHY
+algorithm (dechirp/FFT, Gray, diagonal interleave, Hamming FEC, whitening),
+verified to round-trip against itself, but is **not yet verified bit-exact
+against Semtech's reference implementation or a real chipset** (e.g. no
+separate header-CRC field, whitening table generated from the stated LFSR
+rather than copied from a reference table). Real-hardware validation needs an
+actual RSPdx capture of a real LoRa transmission -- flagged in the original
+plan as a manual step for the user, not a blocker for this implementation.
+
+Known perf note: per-symbol demod in `decode_frame` is an unvectorized
+Python loop (one FFT per symbol). Fine for the test suite (worst case here:
+~4 min for 720 cases including large SF/OSR/payload combos) but would be
+worth vectorizing before decoding long real captures interactively.
