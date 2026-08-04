@@ -171,7 +171,10 @@ def decode_frame(
     n_sym = chirp.samples_per_symbol(sf, bw, fs)
     sync_offset = preamble_start + n_preamble * n_sym
     sync_syms, _ = _demod_symbols(iq, sync_offset, 2, sf, bw, fs)
-    expected_sync = [((sync_word >> 4) & 0xF) * 8, (sync_word & 0xF) * 8]
+    # See lora_modulator.build_frame: nibble shift is 2**(sf-4), not a fixed
+    # *8 (only correct at SF=7).
+    sync_shift = 1 << (sf - 4)
+    expected_sync = [((sync_word >> 4) & 0xF) * sync_shift, (sync_word & 0xF) * sync_shift]
     sync_ok = sync_syms == expected_sync
 
     # header: sf-2 effective bits, always CR 4/8

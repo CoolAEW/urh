@@ -83,9 +83,12 @@ def build_frame(
     for _ in range(n_preamble):
         parts.append(up0)
 
-    # Sync word: 2 upchirps at shift = nibble * 8
-    sync_hi = ((sync_word >> 4) & 0xF) * 8
-    sync_lo = (sync_word & 0xF) * 8
+    # Sync word: 2 upchirps, each nibble placed in the top 4 bits of the
+    # SF-bit symbol space, i.e. shifted by 2**(sf-4) -- NOT a fixed *8
+    # (that's only correct at SF=7, where 2**(7-4) == 8).
+    sync_shift = 1 << (sf - 4)
+    sync_hi = ((sync_word >> 4) & 0xF) * sync_shift
+    sync_lo = (sync_word & 0xF) * sync_shift
     parts.append(chirp.chirp_symbol(sync_hi, sf, bw, fs, downchirp=False))
     parts.append(chirp.chirp_symbol(sync_lo, sf, bw, fs, downchirp=False))
 
