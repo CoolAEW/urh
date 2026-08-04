@@ -93,6 +93,40 @@ def _matched_filter_magnitudes(iq, template):
     return np.abs(corr[:valid_len])
 
 
+#: find_frame_start's "peak must clear the noise floor by this much" gate --
+#: also the natural cheap accept/reject/ranking signal for lora_autodetect's
+#: SF/BW sweep (see preamble_match_score).
+NOISE_FLOOR_CLEARANCE = 6.0
+
+
+def preamble_match_score(iq, sf, bw, fs, n_preamble=DEFAULT_N_PREAMBLE):
+    """The FFT-based matched-filter computation find_frame_start needs
+    anyway, factored out so lora_autodetect's SF/BW sweep can reuse it as a
+    cheap ranking score (peak-to-noise-floor ratio) without needing the
+    subsequent peak-snapping/backward-walk work that only matters once a
+    real candidate has been chosen.
+
+    Returns (mag, peak_val, noise_floor). Raises LoRaSyncError if the
+    capture is too short to contain a preamble at this sf/bw/fs, or has no
+    signal energy at all -- both are "this candidate doesn't apply /
+    doesn't clear noise floor" cases for a caller ranking many candidates,
+    not truly exceptional.
+    """
+    n_sym = chirp.samples_per_symbol(sf, bw, fs)
+    if len(iq) < (n_preamble + 2) * n_sym:
+        raise LoRaSyncError("capture too short to contain a preamble")
+
+    up0 = chirp.reference_upchirp(sf, bw, fs)
+    mag = _matched_filter_magnitudes(iq, up0)
+
+    peak_val = float(mag.max()) if len(mag) else 0.0
+    if peak_val <= 0:
+        raise LoRaSyncError("no signal energy found")
+
+    noise_floor = float(np.median(mag))
+    return mag, peak_val, noise_floor
+
+
 def find_frame_start(
     iq,
     sf,
@@ -115,22 +149,13 @@ def find_frame_start(
     peak as the frame start.
     """
     n_sym = chirp.samples_per_symbol(sf, bw, fs)
-    if len(iq) < (n_preamble + 2) * n_sym:
-        raise LoRaSyncError("capture too short to contain a preamble")
-
-    up0 = chirp.reference_upchirp(sf, bw, fs)
-    mag = _matched_filter_magnitudes(iq, up0)
-
-    peak_val = float(mag.max()) if len(mag) else 0.0
-    if peak_val <= 0:
-        raise LoRaSyncError("no signal energy found")
+    mag, peak_val, noise_floor = preamble_match_score(iq, sf, bw, fs, n_preamble)
 
     # A relative threshold alone can never say "no signal" -- there's always
     # *some* max, even in pure noise. Require the peak to also clear the
     # noise floor by a healthy margin (peak-to-median, same rationale as
     # _symbol_peakiness: SF/OSR-independent, unlike peak-to-sum).
-    noise_floor = float(np.median(mag))
-    if peak_val < 6.0 * max(noise_floor, 1e-12):
+    if peak_val < NOISE_FLOOR_CLEARANCE * max(noise_floor, 1e-12):
         raise LoRaSyncError("no preamble-strength signal found (peak does not clear noise floor)")
 
     strong = np.where(mag > threshold_ratio * peak_val)[0]

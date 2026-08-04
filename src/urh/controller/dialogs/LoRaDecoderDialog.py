@@ -19,18 +19,48 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
     QProgressBar,
+    QPushButton,
     QSpinBox,
     QVBoxLayout,
 )
 
+from urh.lora import lora_autodetect
 from urh.lora.lora_demod import scan_for_frames
-from urh.lora.lora_frame_format import DEFAULT_N_PREAMBLE, DEFAULT_SYNC_WORD
+from urh.lora.lora_frame_format import DEFAULT_N_PREAMBLE, DEFAULT_SYNC_WORD, STANDARD_BANDWIDTHS
 from urh.lora.protocols import identify
 from urh.signalprocessing.Signal import Signal
+
+#: How much of the loaded signal's IQ (from the start) the "Auto-detect"
+#: button scans. A short snippet, not the whole capture -- the point of
+#: auto-detect is to identify parameters quickly, and the SF x BW grid
+#: sweep is O(60x) a single scan. Long enough to contain a handful of
+#: preamble symbols even for a slow (high-SF, low-BW) real-world combo;
+#: very-low-BW candidates in the standard grid may still get pruned for
+#: being too slow to fit -- see lora_autodetect.estimate.
+AUTO_DETECT_SNIPPET_SECONDS = 3.0
+
+
+class _AutoDetectWorker(QThread):
+    finished_ok = pyqtSignal(list)  # list[AutoDetectCandidate]
+    failed = pyqtSignal(str)
+
+    def __init__(self, iq_snippet, fs, parent=None):
+        super().__init__(parent)
+        self.iq_snippet = iq_snippet
+        self.fs = fs
+
+    def run(self):
+        try:
+            candidates = lora_autodetect.estimate(self.iq_snippet, self.fs)
+        except Exception as e:
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit(candidates)
 
 
 class _ScanWorker(QThread):
@@ -70,23 +100,13 @@ class _ScanWorker(QThread):
 
 
 class LoRaDecoderDialog(QDialog):
-    BANDWIDTHS = [
-        ("7.8 kHz", 7800),
-        ("10.4 kHz", 10400),
-        ("15.6 kHz", 15600),
-        ("20.8 kHz", 20800),
-        ("31.25 kHz", 31250),
-        ("41.7 kHz", 41700),
-        ("62.5 kHz", 62500),
-        ("125 kHz", 125000),
-        ("250 kHz", 250000),
-        ("500 kHz", 500000),
-    ]
+    BANDWIDTHS = STANDARD_BANDWIDTHS
 
     def __init__(self, signal: Signal, parent=None):
         super().__init__(parent)
         self.signal = signal
         self.worker = None
+        self.autodetect_worker = None
         self.setWindowTitle(self.tr("LoRa Decoder"))
         self.setMinimumWidth(480)
 
@@ -128,6 +148,16 @@ class LoRaDecoderDialog(QDialog):
         form.addRow(self.tr("Sync word (hex):"), self.sync_word_edit)
         form.addRow(self.tr("Signal sample rate:"), self.sample_rate_label)
 
+        self.autodetect_button = QPushButton(self.tr("Auto-detect"), self)
+        self.autodetect_button.setToolTip(
+            self.tr("Scan the first {0:.0f}s of the loaded signal across the standard "
+                    "SF/bandwidth grid and fill in the fields above with the best match.")
+            .format(AUTO_DETECT_SNIPPET_SECONDS)
+        )
+        autodetect_row = QHBoxLayout()
+        autodetect_row.addWidget(self.autodetect_button)
+        autodetect_row.addStretch(1)
+
         self.status_label = QLabel(self)
         self.status_label.setText(self.tr("Idle."))
 
@@ -155,6 +185,7 @@ class LoRaDecoderDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addLayout(autodetect_row)
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.result_view)
@@ -164,6 +195,7 @@ class LoRaDecoderDialog(QDialog):
         self.decode_button.clicked.connect(self.on_decode_clicked)
         self.cancel_button.clicked.connect(self.on_cancel_clicked)
         self.close_button.clicked.connect(self.close)
+        self.autodetect_button.clicked.connect(self.on_autodetect_clicked)
 
     @staticmethod
     def _monospace_font():
@@ -188,11 +220,14 @@ class LoRaDecoderDialog(QDialog):
         if self.worker is not None and self.worker.isRunning():
             self.worker.request_stop()
             self.worker.wait(5000)
+        if self.autodetect_worker is not None and self.autodetect_worker.isRunning():
+            self.autodetect_worker.wait(5000)
         super().closeEvent(event)
 
     def _set_running(self, running: bool):
         self.decode_button.setEnabled(not running)
         self.cancel_button.setEnabled(running)
+        self.autodetect_button.setEnabled(not running)
         for w in (self.sf_spinbox, self.bw_combobox, self.cr_combobox,
                   self.n_preamble_spinbox, self.sync_word_edit):
             w.setEnabled(not running)
@@ -201,6 +236,77 @@ class LoRaDecoderDialog(QDialog):
         if self.worker is not None:
             self.status_label.setText(self.tr("Cancelling..."))
             self.worker.request_stop()
+
+    def on_autodetect_clicked(self):
+        if self.signal is None:
+            self.result_view.setPlainText(self.tr("No signal loaded."))
+            return
+
+        fs = float(self.signal.sample_rate)
+        full_iq = self.signal.iq_array.as_complex64()
+        snippet_len = min(len(full_iq), int(AUTO_DETECT_SNIPPET_SECONDS * fs))
+        iq_snippet = full_iq[:snippet_len]
+
+        self.result_view.setPlainText("")
+        self.progress_bar.setRange(0, 0)  # indeterminate -- the grid sweep has no natural per-step progress hook
+        self.status_label.setText(self.tr("Auto-detecting SF/bandwidth..."))
+        self._set_running(True)
+
+        self.autodetect_worker = _AutoDetectWorker(iq_snippet, fs, parent=self)
+        self.autodetect_worker.finished_ok.connect(self._on_autodetect_finished)
+        self.autodetect_worker.failed.connect(self._on_autodetect_failed)
+        self.autodetect_worker.finished.connect(lambda: self._set_running(False))
+        self.autodetect_worker.start()
+
+    def _on_autodetect_finished(self, candidates):
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+
+        if not candidates:
+            self.status_label.setText(self.tr("Auto-detect: no candidate found."))
+            self.result_view.setPlainText(
+                self.tr("No LoRa-like signal found in the first {0:.0f}s of this "
+                        "signal at any standard SF/bandwidth combination.")
+                .format(AUTO_DETECT_SNIPPET_SECONDS)
+            )
+            return
+
+        best = candidates[0]
+        # Write the winning candidate into the same manually-editable
+        # fields a user would set by hand -- mirrors Signal.auto_detect()'s
+        # "auto-detect writes into the same fields" pattern for URH's
+        # native ASK/FSK/PSK modulations.
+        self.sf_spinbox.setValue(best.sf)
+        bw_values = [bw for _, bw in self.BANDWIDTHS]
+        if best.bw in bw_values:
+            self.bw_combobox.setCurrentIndex(bw_values.index(best.bw))
+        if best.n_preamble is not None:
+            self.n_preamble_spinbox.setValue(best.n_preamble)
+        if best.sync_word is not None:
+            self.sync_word_edit.setText(f"0x{best.sync_word:02X}")
+
+        confirmed = best.decode_result is not None
+        self.status_label.setText(
+            self.tr("Auto-detect: SF{0}/{1:,.0f}Hz ({2}) -- fields updated, "
+                    "click Decode to run the full scan.")
+            .format(best.sf, best.bw, self.tr("confirmed by decode") if confirmed
+                    else self.tr("best cheap-stage match, unconfirmed"))
+        )
+
+        lines = [
+            f"Auto-detect scanned the first {AUTO_DETECT_SNIPPET_SECONDS:.0f}s of the "
+            f"signal across the standard SF/bandwidth grid. Top candidates "
+            f"(by preamble matched-filter strength):",
+            "",
+        ]
+        for c in candidates[:5]:
+            status = "decoded OK" if c.decode_result is not None else "not attempted (outside top candidates)"
+            lines.append(f"  SF{c.sf}, {c.bw:,.0f} Hz -- score {c.score:.1f} ({status})")
+        self.result_view.setPlainText("\n".join(lines))
+
+    def _on_autodetect_failed(self, message):
+        self.status_label.setText(self.tr("Auto-detect error."))
+        self.result_view.setPlainText(self.tr("Auto-detect error: ") + message)
 
     def on_decode_clicked(self):
         if self.signal is None:

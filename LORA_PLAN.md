@@ -403,4 +403,54 @@ Cython porting of the hot `_dechirp_fft` inner loop remains explicitly out of
 scope (per the approved plan) -- only worth pursuing if a future real-capture
 pass shows scan latency is still a problem after this dedup.
 
-### Phases 3-4 (SF/BW auto-detect, table UI): not yet started
+### Phase 3: SF/BW auto-detect -- DONE
+
+New module `src/urh/lora/lora_autodetect.py` (pure Python/numpy, no PyQt
+dependency, mirroring `AutoInterpretation.estimate()`'s independence from
+`Signal`/Qt). Two-stage cost control:
+1. Cheap: score every (SF, BW) combination in the standard grid (6 SF x 10
+   BW = 60 combos) using a newly-factored-out `preamble_match_score()`
+   (pulled out of `find_frame_start`, which now calls it internally too --
+   single source of truth) -- the peak-to-noise-floor ratio it already
+   computed internally and, until now, just thresholded and discarded.
+   Low-BW candidates are decimated (plain numpy boxcar-average, no scipy
+   available in this environment) toward a ~4x oversampling ratio before
+   matched-filtering, so a low-BW candidate doesn't run a huge symbol
+   length against a high native sample rate. No FEC/payload decode
+   attempted at this stage.
+2. Expensive: full `decode_frame` attempts (via `scan_chunk_for_frames`,
+   trying the same small n_preamble/sync_word candidate sets manual
+   scanning already does) only on the top-K (3) cheap-stage winners, to
+   confirm/select the final answer and opportunistically recover
+   n_preamble/sync_word too.
+
+`LoRaDecoderDialog` gained an "Auto-detect" button (background `QThread` via
+new `_AutoDetectWorker`, reusing the existing progress bar/status label,
+indeterminate progress since the grid sweep has no natural per-step hook)
+that scans the first 3s of the loaded signal and writes the winning
+candidate's SF/BW/preamble-length/sync-word directly into the same
+manually-editable fields a user would set by hand -- mirrors
+`Signal.auto_detect()`'s "auto-detect writes into the same fields" pattern,
+scoped to this dialog's own widgets (no `Signal.py` changes needed).
+
+`LoRaDecoderDialog.BANDWIDTHS` and a new `STANDARD_SPREADING_FACTORS` moved to
+`lora_frame_format.py` as shared constants (`STANDARD_BANDWIDTHS`) so the
+dialog and the autodetect search space reference one list.
+
+Smoke-tested end-to-end through the real QThread/Qt event loop (same pattern
+as prior UI smoke tests): a synthetic SF9/125kHz signal was correctly
+identified and its parameters written into the actual spinbox/combobox
+widgets, not just the underlying `estimate()` function.
+
+New test file `test_lora_autodetect.py` (6 tests): ranks the true SF/BW combo
+at the top across two different grid points, a low-BW/high-SF case to
+exercise snippet-length pruning, no-signal returns no candidates, fuzz-
+robustness across the full grid on garbage input, and a bw-exceeds-sample-
+rate guard. 71/71 tests pass overall.
+
+**Flagged as exploratory** (same caveat as CFO correction and Phase 1's
+collapse thresholds): the 3-second snippet length and top-K=3 defaults are a
+defensible starting point, not validated against real captures yet -- real
+low-SNR or unusual-preset traffic may need these retuned.
+
+### Phase 4 (table UI + context-menu entry point): not yet started
