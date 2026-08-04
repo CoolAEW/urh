@@ -191,3 +191,50 @@ against a real captured frame yet, synthetic-only so far as with the PHY
 layer. MeshCore's smaller 1-byte header is a structurally weaker fingerprint
 than Meshtastic's 16-byte one -- expect more "unknown"/low-confidence calls
 on real MeshCore traffic without SF/BW corroboration than on Meshtastic.
+
+## Real-world validation attempt (live RSPdx capture)
+
+Recorded live IQ with the RSPdx via `tmp_scripts/live_lora_capture.py`
+(raw int16 I/Q to file, using the low-level `sdrplay` Cython binding
+directly with an `mp.Pipe` in place of URH's full subprocess Device
+machinery -- the native callback just needs a `.send_bytes()`-capable
+object) and scanned it in overlapping chunks via
+`tmp_scripts/decode_capture.py` (a single FFT-based matched filter over an
+entire multi-minute capture is impractical -- chunking keeps each
+`find_frame_start` call's FFT a manageable size).
+
+- Meshtastic freq (869.525 MHz), SF11/BW250kHz, 240s @ 2 MSPS, gain=45:
+  matched filter found a strong energy spike at t=52.5s (peak/noise-floor
+  ratio ~50x), but full decode came back `sync_ok=False` with 262
+  uncorrectable errors on a 254-byte payload -- essentially noise-quality,
+  not a real decode, despite `identify()` guessing "meshtastic" at 0.60
+  confidence. Likely not actually a Meshtastic frame (EU868 is a shared
+  ISM band), or frame parameters (preamble length, sync word) don't match
+  what's really on air.
+- MeshCore freq (869.618 MHz), SF8/BW62.5kHz, 90s @ 2 MSPS, gain=45: two
+  energy spikes found. The one at t=0 is the interesting result: only
+  **4 uncorrectable errors across a 226-byte payload** (cr=3), a
+  dramatically better ratio than every other hit in this session (all of
+  which were ~50% garbage, i.e. noise) -- but `sync_ok` was still `False`.
+  That combination (near-clean payload FEC, failed sync-word check) is a
+  specific, actionable lead: it suggests real signal + close-but-not-exact
+  timing/offset alignment (sync word symbols landing a fraction off, or a
+  wrong assumed sync word constant), not "no signal" or "wrong protocol
+  entirely." Worth debugging first on any future pass -- likely a small
+  fix in `find_frame_start`'s SFD-to-header offset or the assumed sync
+  word rather than a fundamental algorithm problem.
+- Neither capture produced a clean `sync_ok=True` decode. Root cause not
+  yet isolated -- didn't have the turns budget in this pass to chase the
+  near-miss down further.
+- Noted but not investigated: a second, concurrent `live_lora_capture.py`
+  process (different invocation, not started by this work) was observed
+  holding/contending for the SDRplay device partway through, causing a
+  `get_devices()` call afterward to return empty. Didn't interfere with
+  it, since its origin was unclear -- flagged for the user/parent session
+  to check for duplicate/conflicting recording attempts before the next
+  live-capture pass.
+
+Raw captures (`tmp_scripts/captures/*.iq`, ~1.9GB + ~730MB) are
+intentionally untracked/not committed -- large binary, easily
+regenerated. The two scripts are committed since they're reusable for the
+next attempt.
