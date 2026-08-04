@@ -65,6 +65,34 @@ class TestIdentifyMeshCore(unittest.TestCase):
             self.assertLess(result.confidence, 0.6)
 
 
+class TestIdentifyPhyConfidence(unittest.TestCase):
+    def test_low_decode_confidence_scales_down_score(self):
+        protobuf = _build_data_protobuf(portnum=1, payload=b"hi")
+        payload = _build_packet(to_=1, from_=2, id_=3, plaintext=protobuf)
+
+        full = identify.identify(payload, sf=11, bw=250000, decode_confidence=1.0)
+        scaled = identify.identify(payload, sf=11, bw=250000, decode_confidence=0.2)
+        self.assertLess(scaled.confidence, full.confidence)
+
+    def test_truncated_payload_scales_down_score_but_not_to_zero(self):
+        protobuf = _build_data_protobuf(portnum=1, payload=b"hi")
+        payload = _build_packet(to_=1, from_=2, id_=3, plaintext=protobuf)
+
+        full = identify.identify(payload, sf=11, bw=250000)
+        truncated = identify.identify(payload, sf=11, bw=250000, payload_truncated=True)
+        self.assertLess(truncated.confidence, full.confidence)
+        self.assertGreater(truncated.confidence, 0.0)
+
+    def test_omitting_phy_confidence_args_is_unchanged_from_before(self):
+        # Backward compatibility: existing call sites that don't pass the
+        # new params must behave exactly as before.
+        protobuf = _build_data_protobuf(portnum=1, payload=b"hi")
+        payload = _build_packet(to_=1, from_=2, id_=3, plaintext=protobuf)
+        result = identify.identify(payload, sf=11, bw=250000)
+        self.assertEqual(result.protocol, "meshtastic")
+        self.assertGreater(result.confidence, 0.9)
+
+
 class TestIdentifyUnknown(unittest.TestCase):
     def test_too_short_for_either_protocol_is_unknown(self):
         result = identify.identify(b"\x00")

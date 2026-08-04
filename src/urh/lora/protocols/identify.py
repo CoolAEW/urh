@@ -117,13 +117,38 @@ def _score_meshcore(payload, sf, bw):
     return score, details, reasons
 
 
-def identify(payload: bytes, sf: int = None, bw: float = None) -> IdentificationResult:
+def identify(
+    payload: bytes,
+    sf: int = None,
+    bw: float = None,
+    decode_confidence: float = None,
+    payload_truncated: bool = False,
+) -> IdentificationResult:
     """Identify a recovered LoRa payload as Meshtastic, MeshCore, or
     unknown. `sf`/`bw` (the demod parameters used to recover this payload)
     are optional but substantially improve confidence when supplied.
+
+    `decode_confidence` (the LoRa-PHY-level decode_frame confidence score,
+    0-1) and `payload_truncated` are optional signals from the PHY layer
+    about how much to trust `payload` in the first place -- without them, a
+    truncated/low-confidence payload that still happens to structurally
+    parse (e.g. a Meshtastic 16-byte header surviving a mid-payload
+    collapse) could score as high as a fully clean decode. When supplied,
+    they scale the final score down; they never *raise* it, since a
+    structural match on truncated/uncertain bytes is never more trustworthy
+    than the same match on a fully confident decode.
     """
     mt_score, mt_details, mt_reasons = _score_meshtastic(payload, sf, bw)
     mc_score, mc_details, mc_reasons = _score_meshcore(payload, sf, bw)
+
+    if payload_truncated:
+        mt_score *= 0.5
+        mc_score *= 0.5
+        mt_reasons = mt_reasons + ["payload was truncated (mid-frame signal collapse) -- reduced confidence"]
+        mc_reasons = mc_reasons + ["payload was truncated (mid-frame signal collapse) -- reduced confidence"]
+    if decode_confidence is not None:
+        mt_score *= decode_confidence
+        mc_score *= decode_confidence
 
     best_score = max(mt_score, mc_score)
     if best_score < _MIN_CONFIDENCE:

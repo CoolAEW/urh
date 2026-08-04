@@ -45,6 +45,11 @@ class TestFrameRoundTrip(unittest.TestCase):
                     self.assertEqual(result["cr"], cr)
                     self.assertTrue(result["sync_ok"])
                     self.assertEqual(result["uncorrectable_errors"], 0)
+                    self.assertFalse(result["payload_truncated"])
+                    self.assertGreater(
+                        result["confidence"], 0.8,
+                        f"clean decode should score high confidence: sf={sf} cr={cr} len={len(payload)}",
+                    )
 
     def test_round_trip_with_noise_and_random_offset(self):
         rng = np.random.default_rng(42)

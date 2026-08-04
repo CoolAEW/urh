@@ -36,19 +36,45 @@ def demod_symbol(window, sf, bw, fs):
     return int(np.argmax(mag))
 
 
-def _symbol_peakiness(window, sf, bw, fs, downchirp_ref=None):
-    """peak-bin-magnitude / median-bin-magnitude. Peak-to-*median* (rather
-    than peak-to-sum) is roughly SF-independent: sum-of-all-bins grows with
-    N=2**sf even though the noise floor per bin doesn't, so peak/sum silently
-    gets harder to clear at higher SF for no real detection-quality reason."""
-    n = 1 << sf
-    down = downchirp_ref if downchirp_ref is not None else chirp.reference_downchirp(sf, bw, fs)
-    y = window * down
-    mag = np.abs(np.fft.fft(y))[:n]
+def _demod_symbol_with_peakiness(window, sf, bw, fs, downchirp_ref):
+    """Dechirp one symbol-length window and return (bin, peakiness) from a
+    single FFT pass -- shared by demod_symbol/_symbol_peakiness below and by
+    _demod_symbols' per-symbol loop, so getting peakiness "for free" during
+    header/payload demod doesn't cost a second FFT per symbol.
+
+    peakiness = peak-bin-magnitude / median-bin-magnitude. Peak-to-*median*
+    (rather than peak-to-sum) is roughly SF-independent: sum-of-all-bins
+    grows with N=2**sf even though the noise floor per bin doesn't, so
+    peak/sum silently gets harder to clear at higher SF for no real
+    detection-quality reason. peakiness is 0.0 for an exactly-zero/flat
+    window (median==0), which is the real, observed signature of trailing
+    silence in a live capture (see find_frame_start's collapse-detection
+    callers) rather than an edge case to special-case away.
+    """
+    mag = np.abs(_dechirp_fft(window, sf, bw, fs, downchirp_ref=downchirp_ref))
     peak_bin = int(np.argmax(mag))
-    median = float(np.median(mag))
-    peakiness = float(mag[peak_bin]) / median if median > 0 else 0.0
+    peak_mag = float(mag[peak_bin])
+    # Floor the median to a small fraction of the peak before dividing: with
+    # near-zero real noise (idealized/noiseless synthetic signals, or very
+    # high real SNR), the non-peak bins are dominated by float64 rounding
+    # residue rather than anything physical, and an unclamped median swings
+    # wildly (observed: peakiness varying ~300x between symbols of the
+    # *same* clean synthetic frame purely from this effect), which makes
+    # peakiness useless as a stable per-frame reference for collapse
+    # detection. Flooring caps peakiness at a large-but-stable value in that
+    # regime while leaving genuinely noisy/collapsed windows (where the
+    # floor isn't the binding constraint) unaffected.
+    median = max(float(np.median(mag)), peak_mag * 1e-6)
+    peakiness = peak_mag / median if median > 0 else 0.0
     return peak_bin, peakiness
+
+
+def _symbol_peakiness(window, sf, bw, fs, downchirp_ref=None):
+    """Thin wrapper over _demod_symbol_with_peakiness for standalone
+    (non-_demod_symbols-loop) callers that only want peakiness, not a full
+    symbol-block decode."""
+    down = downchirp_ref if downchirp_ref is not None else chirp.reference_downchirp(sf, bw, fs)
+    return _demod_symbol_with_peakiness(window, sf, bw, fs, down)
 
 
 def _matched_filter_magnitudes(iq, template):
@@ -208,15 +234,24 @@ def apply_cfo_correction(iq, f_offset_hz, fs, start=0):
 
 
 def _demod_symbols(iq, offset, count, sf, bw, fs):
+    """Demod `count` consecutive symbols starting at `offset`. Returns
+    (symbols, peakiness_list, new_offset) -- peakiness rides along for free
+    since it's derived from the same per-symbol FFT the bin value already
+    needed (see _demod_symbol_with_peakiness), letting callers detect a
+    mid-frame collapse into trailing noise without a second demod pass."""
     n_sym = chirp.samples_per_symbol(sf, bw, fs)
     if offset + count * n_sym > len(iq):
         raise LoRaSyncError("not enough samples remaining for requested symbol block")
+    down = chirp.reference_downchirp(sf, bw, fs)
     symbols = []
+    peakiness = []
     for i in range(count):
         start = offset + i * n_sym
         window = iq[start:start + n_sym]
-        symbols.append(demod_symbol(window, sf, bw, fs))
-    return symbols, offset + count * n_sym
+        b, p = _demod_symbol_with_peakiness(window, sf, bw, fs, down)
+        symbols.append(b)
+        peakiness.append(p)
+    return symbols, peakiness, offset + count * n_sym
 
 
 def _decode_block_stream(raw_symbols, ppm, rdd, cr, shift_bits=0):
@@ -236,6 +271,79 @@ def _decode_block_stream(raw_symbols, ppm, rdd, cr, shift_bits=0):
     return nibbles, uncorrectable_count
 
 
+# --- mid-frame collapse detection (see decode_frame) ---
+# A payload symbol is "collapsed" (no real signal) if its peakiness drops
+# below this fraction of the frame's own header-derived reference peakiness.
+# Not derivable from synthetic AWGN alone -- real trailing silence dechirps
+# to a stable near-zero peakiness in a way generic noise doesn't reproduce;
+# starting value, expected to need retuning against real captures.
+PAYLOAD_COLLAPSE_FRACTION = 0.3
+# Require this many *consecutive* collapsed symbols before truncating, so a
+# momentary real-RF fade/null doesn't kill an otherwise-good frame.
+PAYLOAD_COLLAPSE_RUN_LENGTH = 4
+
+# --- composite confidence score weights (see decode_frame) ---
+# Multiplicative penalty when sync_ok is False -- not a hard gate, since a
+# sync-word mismatch with otherwise-clean FEC has already been a genuinely
+# promising, worth-investigating signal in real captures (see LORA_PLAN.md).
+CONFIDENCE_SYNC_FAIL_PENALTY = 0.3
+# error rate -> exp(-rate * K): K chosen so ~1% errors scores ~0.92 and ~50%
+# (noise-level) scores ~0.02 -- a soft curve, not a hard cutoff.
+CONFIDENCE_ERROR_RATE_K = 8.0
+CONFIDENCE_WEIGHT_ERROR_RATE = 0.4
+# The strongest, most physically-grounded signal: whether the payload's
+# symbols stayed as peaky as the header's throughout, i.e. real signal
+# rather than a collapse into trailing noise.
+CONFIDENCE_WEIGHT_PEAKINESS = 0.4
+# Weighted lower than peakiness: legitimate payloads can have genuinely
+# low-entropy stretches (zero-padding, repeated fields), so this is a soft
+# secondary signal, not a gate.
+CONFIDENCE_WEIGHT_ENTROPY = 0.2
+# Below this many payload symbols, entropy is too noisy a statistic to be
+# meaningful -- treat as neutral (1.0) rather than penalizing short payloads.
+CONFIDENCE_ENTROPY_MIN_SYMBOLS = 8
+
+
+def _collapse_run_start(peakiness_list, reference, fraction, run_length):
+    """Index of the first symbol in a *sustained* run of >= run_length
+    consecutive symbols with peakiness < fraction*reference, or None if no
+    such run exists. reference<=0 (a degenerate/silent header -- shouldn't
+    normally happen since find_frame_start already gates on signal presence,
+    but guard anyway) disables collapse detection rather than flagging
+    everything."""
+    if reference <= 0:
+        return None
+    threshold = fraction * reference
+    run_start = None
+    run_len = 0
+    for i, p in enumerate(peakiness_list):
+        if p < threshold:
+            if run_len == 0:
+                run_start = i
+            run_len += 1
+            if run_len >= run_length:
+                return run_start
+        else:
+            run_len = 0
+    return None
+
+
+def _symbol_entropy_score(symbols, sf):
+    """Shannon entropy of the demodulated-bin histogram, normalized to
+    [0, 1] against the maximum possible (log2(2**sf), i.e. uniform bin
+    usage). A degenerate constant-symbol run (the observed real-world
+    trailing-noise failure mode) scores 0.0 here. Short payloads don't carry
+    enough symbols for entropy to mean much -- see
+    CONFIDENCE_ENTROPY_MIN_SYMBOLS."""
+    if len(symbols) < CONFIDENCE_ENTROPY_MIN_SYMBOLS:
+        return 1.0
+    _, counts = np.unique(symbols, return_counts=True)
+    probs = counts / len(symbols)
+    entropy = float(-np.sum(probs * np.log2(probs)))
+    max_entropy = sf  # log2(2**sf)
+    return entropy / max_entropy if max_entropy > 0 else 1.0
+
+
 def decode_frame(
     iq,
     sf,
@@ -248,7 +356,15 @@ def decode_frame(
     """Full receive chain: locate frame, decode header, decode payload.
 
     Returns a dict: {payload: bytes, cr: int, uncorrectable_errors: int,
-    sync_ok: bool, header_start: int, cfo_hz: float}.
+    sync_ok: bool, header_start: int, cfo_hz: float, confidence: float,
+    payload_truncated: bool, truncated_at_symbol: int or None}.
+
+    If real signal ends partway through the payload (trailing noise/silence
+    after a genuinely short transmission), that trailing region is detected
+    via a sustained drop in per-symbol peakiness relative to the header and
+    the payload is *truncated* to what decoded before the collapse rather
+    than either trusting clearly-bogus trailing bytes or discarding an
+    otherwise-correct partial decode outright -- see PAYLOAD_COLLAPSE_*.
     """
     if fs is None:
         fs = bw
@@ -279,7 +395,7 @@ def decode_frame(
     # sanity-check the sync word symbols (informational, not fatal)
     n_sym = chirp.samples_per_symbol(sf, bw, fs)
     sync_offset = preamble_start + n_preamble * n_sym
-    sync_syms, _ = _demod_symbols(iq, sync_offset, 2, sf, bw, fs)
+    sync_syms, _, _ = _demod_symbols(iq, sync_offset, 2, sf, bw, fs)
     # See lora_modulator.build_frame: nibble shift is 2**(sf-4), not a fixed
     # *8 (only correct at SF=7).
     sync_shift = 1 << (sf - 4)
@@ -289,7 +405,9 @@ def decode_frame(
     # header: sf-2 effective bits, always CR 4/8
     ppm_hdr = sf - 2
     rdd_hdr = 4 + HEADER_CR
-    header_syms, payload_start = _demod_symbols(iq, header_start, rdd_hdr, sf, bw, fs)
+    header_syms, header_peakiness, payload_start = _demod_symbols(
+        iq, header_start, rdd_hdr, sf, bw, fs
+    )
     header_nibbles, header_errs = _decode_block_stream(
         header_syms, ppm_hdr, rdd_hdr, HEADER_CR, shift_bits=HEADER_SHIFT_BITS
     )
@@ -304,9 +422,30 @@ def decode_frame(
     n_blocks = (n_payload_nibbles + sf - 1) // sf
     n_payload_symbols = n_blocks * rdd
 
-    payload_syms, _ = _demod_symbols(iq, payload_start, n_payload_symbols, sf, bw, fs)
+    payload_syms, payload_peakiness, _ = _demod_symbols(
+        iq, payload_start, n_payload_symbols, sf, bw, fs
+    )
     payload_nibbles, payload_errs = _decode_block_stream(payload_syms, sf, rdd, cr, shift_bits=0)
     payload_nibbles = payload_nibbles[:n_payload_nibbles]
+
+    # Mid-frame collapse: use the header's own peakiness as this frame's
+    # reference level (SNR varies across captures, so a fixed global
+    # constant would be fragile) and look for a sustained drop in the
+    # payload relative to it.
+    header_ref_peakiness = float(np.median(header_peakiness)) if header_peakiness else 0.0
+    collapse_symbol = _collapse_run_start(
+        payload_peakiness, header_ref_peakiness,
+        PAYLOAD_COLLAPSE_FRACTION, PAYLOAD_COLLAPSE_RUN_LENGTH,
+    )
+    payload_truncated = collapse_symbol is not None
+    if payload_truncated:
+        good_blocks = collapse_symbol // rdd  # only fully-good blocks are trustworthy
+        good_nibbles = good_blocks * sf
+        payload_nibbles = payload_nibbles[: min(len(payload_nibbles), good_nibbles)]
+    # dewhiten operates byte-wise; drop a dangling odd nibble if truncation
+    # landed mid-byte.
+    if len(payload_nibbles) % 2:
+        payload_nibbles = payload_nibbles[:-1]
 
     whitened_bytes = bytes(
         (payload_nibbles[i] << 4) | payload_nibbles[i + 1]
@@ -314,14 +453,39 @@ def decode_frame(
     )
     payload = phy.dewhiten(whitened_bytes)
 
+    uncorrectable_errors = header_errs + payload_errs
+    total_nibbles = len(header_nibbles) + n_payload_nibbles
+    error_rate = uncorrectable_errors / total_nibbles if total_nibbles else 0.0
+    error_score = float(np.exp(-error_rate * CONFIDENCE_ERROR_RATE_K))
+
+    if payload_peakiness:
+        good_count = collapse_symbol if payload_truncated else len(payload_peakiness)
+        peakiness_score = good_count / len(payload_peakiness)
+    else:
+        peakiness_score = 1.0  # zero-length payload: nothing to collapse
+
+    entropy_score = _symbol_entropy_score(payload_syms, sf) if payload_syms else 1.0
+
+    confidence = (
+        CONFIDENCE_WEIGHT_ERROR_RATE * error_score
+        + CONFIDENCE_WEIGHT_PEAKINESS * peakiness_score
+        + CONFIDENCE_WEIGHT_ENTROPY * entropy_score
+    )
+    if not sync_ok:
+        confidence *= CONFIDENCE_SYNC_FAIL_PENALTY
+    confidence = max(0.0, min(1.0, confidence))
+
     return {
         "payload": payload,
         "cr": cr,
-        "uncorrectable_errors": header_errs + payload_errs,
+        "uncorrectable_errors": uncorrectable_errors,
         "sync_ok": sync_ok,
         "preamble_start": preamble_start,
         "header_start": header_start,
         "cfo_hz": cfo_hz,
+        "confidence": confidence,
+        "payload_truncated": payload_truncated,
+        "truncated_at_symbol": collapse_symbol,
     }
 
 

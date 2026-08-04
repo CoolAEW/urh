@@ -300,3 +300,74 @@ PYTHONPATH=src python3 tmp_scripts/decode_capture.py \
 # or use the full GUI (File -> LoRa Decoder...) on a signal recorded/loaded normally
 PYTHONPATH=src python3 src/urh/main.py
 ```
+
+## Robustness/speed/auto-detect/UI follow-up (2026-08-05)
+
+Real-world testing (see above) surfaced enough real gaps that a proper follow-up
+plan was written and approved (`~/.claude/plans/soft-skipping-rain.md`, 4 phases:
+robustness/confidence scoring, performance dedup, SF/BW auto-detect, table UI +
+context-menu entry point). Implementing in that order.
+
+### Phase 1: peakiness-gated demod + composite confidence score -- DONE
+
+Root cause finally confirmed for the recurring "clean-but-implausible" artifacts
+seen across multiple real captures (e.g. payload header byte `0xFF`): once real
+signal ends mid-frame, the decoder kept blindly demodulating the declared payload
+length into trailing noise. That noise deterministically dechirps to a low-
+diversity, low-peakiness symbol run rather than random values, so it can pass
+Hamming FEC with a deceptively *low* error count -- a false-positive "clean"
+decode. Verified directly against a real capture: peakiness dropped from 3-6.35
+to a hard 0.0 cliff mid-frame, exactly where real content stopped.
+
+Fix, in `lora_demod.py`:
+- Unified the FFT path: `_demod_symbol_with_peakiness()` does one `_dechirp_fft`
+  call per symbol and derives both the bin value and peakiness from the same
+  magnitude array (previously `demod_symbol`/`_symbol_peakiness` were separate,
+  and `_symbol_peakiness` was actually dead code -- defined, never called).
+  `_demod_symbols()` now computes the reference downchirp once before its loop
+  instead of once per symbol (a real, separate perf bug caught in the process)
+  and returns `(symbols, peakiness_list, new_offset)`.
+- Mid-frame collapse detection: per-frame reference peakiness = median of the
+  header symbols' peakiness (not a fixed constant -- SNR varies across
+  captures); a payload symbol is "collapsed" if its peakiness drops below
+  `PAYLOAD_COLLAPSE_FRACTION` (0.3, starting guess) of that reference, and a
+  *sustained* run of >= `PAYLOAD_COLLAPSE_RUN_LENGTH` (4) consecutive collapsed
+  symbols truncates the payload to what decoded before the collapse rather than
+  failing outright -- a truncated Meshtastic/MeshCore header can still
+  corroborate a protocol guess even without the full payload. Result dict gains
+  `payload_truncated`/`truncated_at_symbol`.
+- Composite `confidence` score (0-1): weighted combination of error rate (not
+  raw count), payload-peakiness consistency (the strongest signal -- this is
+  the one that would have caught the `0xFF` artifact), and demodulated-symbol
+  entropy (weighted lower -- legitimate payloads can have genuinely low-entropy
+  stretches, e.g. padding). `sync_ok=False` is a multiplicative penalty
+  (`x0.3`), not a hard gate, since a sync-word mismatch with otherwise-clean FEC
+  has already proven to be a real, worth-investigating signal in real captures
+  (see the "second real-world pass" section above). Weights are named
+  module-level constants for easy retuning -- **not yet validated against real
+  captures, only synthetic**, same caveat as CFO correction's initial rollout.
+- `identify()` gained optional `decode_confidence`/`payload_truncated` params
+  that scale (never raise) its score, so a truncated/uncertain payload can't
+  outscore a clean one purely on structural pattern match. Backward compatible
+  (defaults preserve old behavior).
+- `LoRaDecoderDialog` now sorts hits by `confidence` and surfaces truncation in
+  the result text.
+
+**A real bug was found and fixed during this phase's own testing**: the initial
+peakiness metric (peak-bin-magnitude / median-bin-magnitude) swung wildly
+(~300x) between symbols of the *same clean, noiseless synthetic frame*, because
+with near-zero real noise the non-peak FFT bins are dominated by float64
+rounding residue rather than anything physical -- broke 2 existing tests
+(`test_clean_round_trip_various_params`, `test_fuzz_random_payloads`) via
+false-positive collapse detection on legitimate short payloads. Fixed by
+flooring the median to a small fraction of the peak
+(`max(median, peak_mag * 1e-6)`) before dividing, which stabilizes the metric in
+the noiseless/very-high-SNR regime without affecting genuinely noisy/collapsed
+windows (where the floor isn't the binding constraint). Verified the fix against
+both the previously-broken clean cases and a realistic spliced-trailing-silence
+scenario (`tests/lora/test_lora_confidence.py`) -- collapse detection correctly
+fires only on the latter.
+
+64/64 tests pass (`PYTHONPATH=src python3 -m unittest discover -s tests/lora`).
+
+### Phases 2-4 (performance dedup, SF/BW auto-detect, table UI): not yet started

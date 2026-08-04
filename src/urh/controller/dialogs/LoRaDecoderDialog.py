@@ -261,20 +261,29 @@ class LoRaDecoderDialog(QDialog):
             )
             return
 
-        # Prefer a confirmed sync; among those (or if none), prefer fewer
-        # FEC errors -- both are "closer to a real frame" signals.
-        hits.sort(key=lambda h: (not h["sync_ok"], h["uncorrectable_errors"]))
+        # Sort by the composite PHY-level confidence score (see
+        # lora_demod.decode_frame) -- this is more reliable than sync_ok/
+        # error-count alone, which a degenerate mid-frame collapse into
+        # trailing noise can fool (see LORA_PLAN.md).
+        hits.sort(key=lambda h: -h["confidence"])
 
         self.status_label.setText(
             self.tr("Done -- {0} candidate(s) found.").format(len(hits))
         )
         blocks = []
         for h in hits:
-            id_result = identify.identify(h["payload"], sf=sf, bw=bw)
+            id_result = identify.identify(
+                h["payload"], sf=sf, bw=bw,
+                decode_confidence=h["confidence"], payload_truncated=h["payload_truncated"],
+            )
+            truncated_note = (
+                f" [TRUNCATED at symbol {h['truncated_at_symbol']} -- signal collapsed mid-payload]"
+                if h["payload_truncated"] else ""
+            )
             blocks.append(
                 f"--- t={h['chunk_offset_samples'] / float(self.signal.sample_rate):.1f}s "
                 f"(chunk {h['chunk_idx']}, n_preamble={h['n_preamble']}, "
-                f"sync=0x{h['sync_word']:02X}) ---\n"
+                f"sync=0x{h['sync_word']:02X}, confidence={h['confidence']:.0%}){truncated_note} ---\n"
                 + self._format_result(h, id_result)
             )
         self.result_view.setPlainText("\n\n".join(blocks))
