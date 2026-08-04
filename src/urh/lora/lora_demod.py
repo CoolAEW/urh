@@ -122,6 +122,8 @@ def find_frame_start(
 
 def _demod_symbols(iq, offset, count, sf, bw, fs):
     n_sym = chirp.samples_per_symbol(sf, bw, fs)
+    if offset + count * n_sym > len(iq):
+        raise LoRaSyncError("not enough samples remaining for requested symbol block")
     symbols = []
     for i in range(count):
         start = offset + i * n_sym
