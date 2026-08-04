@@ -54,3 +54,7 @@ src/urh/URHProject.xml
 src/urh/dev/gr/scripts/top_block.py
 
 misc/*
+
+# raw live-capture IQ files (large, regenerable) and ad-hoc scan logs
+tmp_scripts/captures/
+tmp_scripts/*.log

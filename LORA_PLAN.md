@@ -238,3 +238,65 @@ Raw captures (`tmp_scripts/captures/*.iq`, ~1.9GB + ~730MB) are
 intentionally untracked/not committed -- large binary, easily
 regenerated. The two scripts are committed since they're reusable for the
 next attempt.
+
+## Second real-world pass (same session, continued)
+
+Fixed a real bug found while scanning: `_demod_symbols` could silently
+truncate a symbol window near a chunk boundary and then fail to broadcast
+against the full-length reference chirp instead of raising
+`LoRaSyncError` cleanly (commit `48cdfeff`, all 44 tests still pass
+after).
+
+Re-ran a shorter (60s) Meshtastic-frequency capture at lower gain (35,
+down from 45) to test the clipping hypothesis, timed against the user
+actually sending a live Meshtastic message partway through the window.
+Two findings that change the read on this problem:
+
+1. **Peak amplitude barely moved (~1.07, still at/above full digital
+   scale) despite a 10dB manual gain reduction.** A real analog-frontend
+   clipping fix should have cut that peak by roughly 3x. It didn't --
+   which points at the SDRplay API's internal AGC still being active
+   underneath the manual `gRdB` we set (see `calculate_gain_reduction` in
+   `sdrplay.pyx` -- worth checking whether `sdrplay_api` needs an
+   explicit AGC-disable call, not just a gain value, since the current
+   `init_stream` never touches an AGC control field). **Simply turning
+   the gain knob further is unlikely to fix this on its own.**
+2. **The real signal spike (~t=25s, matching the user's actual send
+   window) produced no frame-sync candidate at all** -- the detector
+   didn't recognize it as a LoRa preamble.
+3. **The only "decode" candidate in this run was at t=0.0s again** --
+   same as the earlier "4-error near-miss" MeshCore result from the first
+   pass, which was also at t=0.0s. Two different captures, two different
+   frequencies/SF/BW, both producing a spurious sync-detector trigger
+   right at recording start. **This reframes that earlier near-miss: it
+   was very likely a capture-startup artifact (buffer priming / filter
+   settling transient), not a near-successful real decode as first
+   thought.** Any future pass should discard the first chunk of each
+   capture, or start `find_frame_start` scanning some margin after
+   stream-open, before trusting a t≈0 hit.
+
+## Status: paused for user to continue hands-on
+
+No clean real-world decode yet. Open leads for whoever picks this up
+next, in priority order: (a) check/disable SDRplay AGC explicitly rather
+than assuming manual `gRdB` alone controls level, (b) trim/ignore t≈0 of
+each capture as a startup-artifact zone, (c) the original CFO/timing-
+offset compensation gap -- synthetic tests never exercised real
+oscillator drift or Doppler/frequency error, which real hardware always
+has and the current `find_frame_start`/`demod_symbol` chain has no
+correction for.
+
+Handy commands for further manual testing:
+```
+# record N seconds at a frequency (defaults: 2 MSPS, 300kHz IF bw)
+cd ~/src/urh-sdrplay-v3
+PYTHONPATH=src python3 tmp_scripts/live_lora_capture.py \
+  --freq 869525000 --duration 60 --out tmp_scripts/captures/out.iq --gain 35
+
+# scan a capture for a decodable frame
+PYTHONPATH=src python3 tmp_scripts/decode_capture.py \
+  --path tmp_scripts/captures/out.iq --sf 11 --bw 250000 --fs 2000000
+
+# or use the full GUI (File -> LoRa Decoder...) on a signal recorded/loaded normally
+PYTHONPATH=src python3 src/urh/main.py
+```
