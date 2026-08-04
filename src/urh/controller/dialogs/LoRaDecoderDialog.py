@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 
 from urh.lora.lora_demod import decode_frame, LoRaSyncError
 from urh.lora.lora_frame_format import DEFAULT_N_PREAMBLE, DEFAULT_SYNC_WORD
+from urh.lora.protocols import identify
 from urh.signalprocessing.Signal import Signal
 
 
@@ -140,10 +141,11 @@ class LoRaDecoderDialog(QDialog):
             self.result_view.setPlainText(self.tr("Decode error: ") + str(e))
             return
 
-        self.result_view.setPlainText(self._format_result(result))
+        id_result = identify.identify(result["payload"], sf=sf, bw=bw)
+        self.result_view.setPlainText(self._format_result(result, id_result))
 
     @staticmethod
-    def _format_result(result):
+    def _format_result(result, id_result):
         payload: bytes = result["payload"]
         hex_str = payload.hex(" ")
         ascii_str = "".join(chr(b) if 32 <= b < 127 else "." for b in payload)
@@ -153,10 +155,27 @@ class LoRaDecoderDialog(QDialog):
             f"Sync word OK:   {result['sync_ok']}",
             f"FEC errors:     {result['uncorrectable_errors']}",
             "",
+            LoRaDecoderDialog._format_identification(id_result),
+            "",
             "Hex:",
             hex_str if hex_str else "(empty)",
             "",
             "ASCII (best-effort):",
             ascii_str if ascii_str else "(empty)",
         ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_identification(id_result):
+        lines = [
+            f"Protocol:       {id_result.protocol} (confidence {id_result.confidence:.0%})",
+        ]
+        if id_result.protocol == "unknown":
+            lines.append("  Not confidently recognized as Meshtastic or MeshCore -- see raw hex/ASCII below.")
+        else:
+            for key, value in id_result.details.items():
+                if isinstance(value, bytes):
+                    value = value.hex(" ") if len(value) <= 16 else f"{value[:16].hex(' ')}... ({len(value)} bytes)"
+                lines.append(f"  {key}: {value}")
+        lines.append("  Reasoning: " + "; ".join(id_result.reasons))
         return "\n".join(lines)

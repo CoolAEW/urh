@@ -133,3 +133,61 @@ Known perf note: per-symbol demod in `decode_frame` is an unvectorized
 Python loop (one FFT per symbol). Fine for the test suite (worst case here:
 ~4 min for 720 cases including large SF/OSR/payload combos) but would be
 worth vectorizing before decoding long real captures interactively.
+
+## Stage 6 -- protocol identification (Meshtastic / MeshCore)
+
+Added after the user asked for the tool to recognize which real-world
+protocol produced a decoded LoRa frame (they have both Meshtastic and
+MeshCore nodes broadcasting nearby), not just show raw payload bytes.
+
+- [x] `src/urh/lora/protocols/meshtastic.py` -- parses the 16-byte
+      unencrypted header, decrypts the payload with the well-known default
+      channel PSK via AES-CTR, and manually walks the resulting `Data`
+      protobuf's tag stream (no generated protobuf bindings needed) to pull
+      out portnum/payload/dest/source. Verified against primary source
+      (meshtastic/firmware `Channels.{h,cpp}` for the PSK + key expansion,
+      `CryptoEngine.cpp` for the nonce construction, meshtastic/protobufs
+      `mesh.proto`/`portnums.proto` for message layout) via `gh api
+      search/code` + direct file fetches, not guessed or taken from a single
+      third-party source. `tests/lora/test_meshtastic.py`: 7 tests, including
+      a full encrypt-then-decrypt round trip and a negative test (wrong key
+      must not falsely decrypt).
+- [x] `src/urh/lora/protocols/meshcore.py` -- parses the 1-byte
+      route/payload-type/version header, optional transport codes, and node
+      hash path; fully decodes ADVERT payloads (Ed25519 pubkey/timestamp/
+      signature/appdata incl. lat-lon/features/name, with real Ed25519
+      signature verification when `cryptography` is available). TXT_MSG/
+      GRP_TXT/REQ/RESPONSE/PATH payloads are parsed structurally
+      (dest_hash/src_hash/MAC/ciphertext-length) but the ciphertext is
+      correctly reported as "encrypted, key unknown" rather than faked --
+      decrypting those needs a per-node X25519 shared secret we don't have
+      for arbitrary nearby nodes, which is a real limitation, not a bug to
+      fix later. Verified against primary source (meshcore-dev/MeshCore
+      `docs/packet_format.md` + `docs/payloads.md`); this pass corrected one
+      detail from the earlier research summary (hash-size code `0b11` is
+      *reserved/invalid*, not a 4-byte hash size). `tests/lora/
+      test_meshcore.py`: 12 tests covering header bits, ADVERT (incl.
+      tampered-signature rejection), path/transport-code parsing, and the
+      TXT_MSG-shaped "don't fabricate plaintext" case.
+- [x] `src/urh/lora/protocols/identify.py` -- scores payload bytes (+
+      optional SF/BW the frame was demodulated with) against both formats;
+      returns a protocol guess with a 0-1 confidence and human-readable
+      reasons, not a bare boolean. A pure structural parse alone is
+      deliberately not enough to call it identified (`_MIN_CONFIDENCE`) --
+      needs SF/BW corroboration and/or a successful decode/decrypt.
+      `tests/lora/test_identify.py`: 8 tests, including a 50-iteration
+      random-bytes fuzz test asserting the identifier never crashes and
+      confidence always stays in [0,1].
+- [x] Wired into `LoRaDecoderDialog`: after payload recovery, runs
+      `identify.identify()` with the dialog's chosen SF/BW and shows a
+      protocol/confidence/fields summary above the existing raw hex/ASCII
+      view (which stays, since identification can be wrong).
+
+Full suite: 44/44 tests pass (17 PHY + 27 new protocol tests) --
+`python3 -m unittest discover -s tests/lora -v`.
+
+Known limitation carried over from Stage 4/5: none of this has been run
+against a real captured frame yet, synthetic-only so far as with the PHY
+layer. MeshCore's smaller 1-byte header is a structurally weaker fingerprint
+than Meshtastic's 16-byte one -- expect more "unknown"/low-confidence calls
+on real MeshCore traffic without SF/BW corroboration than on Meshtastic.
