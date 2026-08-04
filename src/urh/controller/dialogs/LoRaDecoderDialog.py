@@ -28,7 +28,18 @@ from urh.signalprocessing.Signal import Signal
 
 
 class LoRaDecoderDialog(QDialog):
-    BANDWIDTHS = [("125 kHz", 125000), ("250 kHz", 250000), ("500 kHz", 500000)]
+    BANDWIDTHS = [
+        ("7.8 kHz", 7800),
+        ("10.4 kHz", 10400),
+        ("15.6 kHz", 15600),
+        ("20.8 kHz", 20800),
+        ("31.25 kHz", 31250),
+        ("41.7 kHz", 41700),
+        ("62.5 kHz", 62500),
+        ("125 kHz", 125000),
+        ("250 kHz", 250000),
+        ("500 kHz", 500000),
+    ]
 
     def __init__(self, signal: Signal, parent=None):
         super().__init__(parent)
@@ -43,6 +54,9 @@ class LoRaDecoderDialog(QDialog):
         self.bw_combobox = QComboBox(self)
         for label, _ in self.BANDWIDTHS:
             self.bw_combobox.addItem(label)
+        self.bw_combobox.setCurrentIndex(
+            [bw for _, bw in self.BANDWIDTHS].index(125000)
+        )
 
         self.cr_combobox = QComboBox(self)
         for cr in (1, 2, 3, 4):
