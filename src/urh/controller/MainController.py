@@ -300,6 +300,9 @@ class MainController(QMainWindow):
         )
         self.signal_tab_controller.files_dropped.connect(self.on_files_dropped)
         self.signal_tab_controller.frame_was_dropped.connect(self.set_frame_numbers)
+        self.signal_tab_controller.lora_decode_requested.connect(
+            self.on_lora_decode_requested
+        )
 
         self.simulator_tab_controller.open_in_analysis_requested.connect(
             self.on_simulator_open_in_analysis_requested
@@ -965,17 +968,28 @@ class MainController(QMainWindow):
         r.device_parameters_changed.connect(pm.set_device_parameters)
         r.show()
 
-    @pyqtSlot()
-    def on_show_lora_decoder_dialog_action_triggered(self):
-        frames = self.signal_tab_controller.signal_frames
-        if not frames:
+    def open_lora_decoder_dialog(self, signal):
+        """Shared by both entry points: the File-menu action (which always
+        targets the first loaded signal, for backward compatibility) and
+        the per-signal right-click context-menu action (which targets
+        whichever signal was clicked)."""
+        if signal is None:
             Errors.generic_error(
                 self.tr("No signal loaded"),
                 self.tr("Load a signal (File -> Open) before opening the LoRa decoder."),
             )
             return
-        dialog = LoRaDecoderDialog(frames[0].signal, parent=self)
+        dialog = LoRaDecoderDialog(signal, parent=self)
         dialog.show()
+
+    @pyqtSlot()
+    def on_show_lora_decoder_dialog_action_triggered(self):
+        frames = self.signal_tab_controller.signal_frames
+        self.open_lora_decoder_dialog(frames[0].signal if frames else None)
+
+    @pyqtSlot(Signal)
+    def on_lora_decode_requested(self, signal):
+        self.open_lora_decoder_dialog(signal)
 
     @pyqtSlot(list)
     def on_signals_recorded(self, recorded_files: list):

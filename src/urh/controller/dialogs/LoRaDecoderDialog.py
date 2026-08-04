@@ -1,11 +1,13 @@
 """Minimal LoRa (chirp spread spectrum) decoder dialog.
 
 Takes the raw IQ of a loaded Signal plus user-supplied SF/BW/sync word and
-runs it through the standalone LoRa RX chain in urh.lora, showing the
-decoded payload as hex + best-effort ASCII. This is intentionally built
-without a .ui file (plain QDialog + code-built layout) to keep it additive
-and self-contained -- see LORA_PLAN.md for why LoRa doesn't fit the existing
-Signal/Modulator pipeline.
+runs it through the standalone LoRa RX chain in urh.lora, showing decoded
+candidates in a table (sortable by confidence, one row per scan hit) with a
+detail pane for the full hex/ASCII/identification breakdown of whichever row
+is selected. This is intentionally built without a .ui file (plain QDialog +
+code-built layout) to keep it additive and self-contained -- see
+LORA_PLAN.md for why LoRa doesn't fit the existing Signal/Modulator
+pipeline as a first-class modulation_type.
 
 Scanning runs on a QThread with chunk-level progress reporting (via
 lora_demod.scan_for_frames), since a signal can be many minutes of IQ and a
@@ -15,17 +17,21 @@ feedback for a long time.
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
 )
 
@@ -43,6 +49,10 @@ from urh.signalprocessing.Signal import Signal
 #: very-low-BW candidates in the standard grid may still get pruned for
 #: being too slow to fit -- see lora_autodetect.estimate.
 AUTO_DETECT_SNIPPET_SECONDS = 3.0
+
+_HITS_TABLE_COLUMNS = (
+    "Time", "Confidence", "Sync OK", "Protocol", "CR", "FEC errors", "Truncated", "Payload preview",
+)
 
 
 class _AutoDetectWorker(QThread):
@@ -107,8 +117,14 @@ class LoRaDecoderDialog(QDialog):
         self.signal = signal
         self.worker = None
         self.autodetect_worker = None
+        # Parallel lists: row i of hits_table corresponds to
+        # self._hits[i] / self._id_results[i]. Populated by _on_scan_finished,
+        # read back by _on_hits_table_selection_changed.
+        self._hits = []
+        self._id_results = []
         self.setWindowTitle(self.tr("LoRa Decoder"))
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(640)
+        self.resize(760, 560)
 
         self.sf_spinbox = QSpinBox(self)
         self.sf_spinbox.setRange(7, 12)
@@ -166,12 +182,30 @@ class LoRaDecoderDialog(QDialog):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
 
-        self.result_view = QPlainTextEdit(self)
-        self.result_view.setReadOnly(True)
-        self.result_view.setPlaceholderText(
-            self.tr("Decoded payload will appear here.")
+        # One row per scan hit, sorted by confidence descending -- see
+        # _on_scan_finished. Styling mirrors ui_csv_wizard.py's
+        # tableWidgetPreview, the closest existing lightweight QTableWidget
+        # reference in this codebase (URH has no global theme/.qss file).
+        self.hits_table = QTableWidget(0, len(_HITS_TABLE_COLUMNS), self)
+        self.hits_table.setHorizontalHeaderLabels(_HITS_TABLE_COLUMNS)
+        self.hits_table.setAlternatingRowColors(True)
+        self.hits_table.horizontalHeader().setCascadingSectionResizes(False)
+        self.hits_table.horizontalHeader().setStretchLastSection(True)
+        self.hits_table.verticalHeader().setVisible(False)
+        self.hits_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.hits_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.hits_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.hits_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
         )
-        self.result_view.setFont(self._monospace_font())
+
+        self.detail_view = QPlainTextEdit(self)
+        self.detail_view.setReadOnly(True)
+        self.detail_view.setPlaceholderText(
+            self.tr("Select a row above to see the full decoded payload here, "
+                    "or run Decode/Auto-detect first.")
+        )
+        self.detail_view.setFont(self._monospace_font())
 
         self.button_box = QDialogButtonBox(self)
         self.decode_button = self.button_box.addButton(
@@ -188,7 +222,8 @@ class LoRaDecoderDialog(QDialog):
         layout.addLayout(autodetect_row)
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress_bar)
-        layout.addWidget(self.result_view)
+        layout.addWidget(self.hits_table, stretch=1)
+        layout.addWidget(self.detail_view, stretch=1)
         layout.addWidget(self.button_box)
         self.setLayout(layout)
 
@@ -196,6 +231,7 @@ class LoRaDecoderDialog(QDialog):
         self.cancel_button.clicked.connect(self.on_cancel_clicked)
         self.close_button.clicked.connect(self.close)
         self.autodetect_button.clicked.connect(self.on_autodetect_clicked)
+        self.hits_table.itemSelectionChanged.connect(self._on_hits_table_selection_changed)
 
     @staticmethod
     def _monospace_font():
@@ -232,6 +268,12 @@ class LoRaDecoderDialog(QDialog):
                   self.n_preamble_spinbox, self.sync_word_edit):
             w.setEnabled(not running)
 
+    def _clear_results(self, placeholder_text=""):
+        self._hits = []
+        self._id_results = []
+        self.hits_table.setRowCount(0)
+        self.detail_view.setPlainText(placeholder_text)
+
     def on_cancel_clicked(self):
         if self.worker is not None:
             self.status_label.setText(self.tr("Cancelling..."))
@@ -239,7 +281,7 @@ class LoRaDecoderDialog(QDialog):
 
     def on_autodetect_clicked(self):
         if self.signal is None:
-            self.result_view.setPlainText(self.tr("No signal loaded."))
+            self._clear_results(self.tr("No signal loaded."))
             return
 
         fs = float(self.signal.sample_rate)
@@ -247,7 +289,7 @@ class LoRaDecoderDialog(QDialog):
         snippet_len = min(len(full_iq), int(AUTO_DETECT_SNIPPET_SECONDS * fs))
         iq_snippet = full_iq[:snippet_len]
 
-        self.result_view.setPlainText("")
+        self._clear_results()
         self.progress_bar.setRange(0, 0)  # indeterminate -- the grid sweep has no natural per-step progress hook
         self.status_label.setText(self.tr("Auto-detecting SF/bandwidth..."))
         self._set_running(True)
@@ -264,7 +306,7 @@ class LoRaDecoderDialog(QDialog):
 
         if not candidates:
             self.status_label.setText(self.tr("Auto-detect: no candidate found."))
-            self.result_view.setPlainText(
+            self.detail_view.setPlainText(
                 self.tr("No LoRa-like signal found in the first {0:.0f}s of this "
                         "signal at any standard SF/bandwidth combination.")
                 .format(AUTO_DETECT_SNIPPET_SECONDS)
@@ -302,15 +344,15 @@ class LoRaDecoderDialog(QDialog):
         for c in candidates[:5]:
             status = "decoded OK" if c.decode_result is not None else "not attempted (outside top candidates)"
             lines.append(f"  SF{c.sf}, {c.bw:,.0f} Hz -- score {c.score:.1f} ({status})")
-        self.result_view.setPlainText("\n".join(lines))
+        self.detail_view.setPlainText("\n".join(lines))
 
     def _on_autodetect_failed(self, message):
         self.status_label.setText(self.tr("Auto-detect error."))
-        self.result_view.setPlainText(self.tr("Auto-detect error: ") + message)
+        self.detail_view.setPlainText(self.tr("Auto-detect error: ") + message)
 
     def on_decode_clicked(self):
         if self.signal is None:
-            self.result_view.setPlainText(self.tr("No signal loaded."))
+            self._clear_results(self.tr("No signal loaded."))
             return
 
         sf = self.sf_spinbox.value()
@@ -321,12 +363,12 @@ class LoRaDecoderDialog(QDialog):
         try:
             sync_word = self._parse_sync_word()
         except ValueError:
-            self.result_view.setPlainText(self.tr("Invalid sync word, expected hex e.g. 0x34"))
+            self._clear_results(self.tr("Invalid sync word, expected hex e.g. 0x34"))
             return
 
         iq = self.signal.iq_array.as_complex64()
 
-        self.result_view.setPlainText("")
+        self._clear_results()
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.status_label.setText(self.tr("Scanning..."))
@@ -350,7 +392,7 @@ class LoRaDecoderDialog(QDialog):
 
     def _on_scan_failed(self, message):
         self.status_label.setText(self.tr("Error."))
-        self.result_view.setPlainText(self.tr("Decode error: ") + message)
+        self.detail_view.setPlainText(self.tr("Decode error: ") + message)
 
     def _on_scan_finished(self, hits, max_mags):
         sf = self.sf_spinbox.value()
@@ -359,7 +401,7 @@ class LoRaDecoderDialog(QDialog):
         if not hits:
             self.status_label.setText(self.tr("Done -- no frame found."))
             peak = max(max_mags) if max_mags else 0.0
-            self.result_view.setPlainText(
+            self.detail_view.setPlainText(
                 self.tr("No LoRa frame found in this signal.\n\n"
                         "Peak |IQ| magnitude observed: {0:.4f} "
                         "(near/above 1.0 suggests clipping; near 0 suggests "
@@ -376,23 +418,51 @@ class LoRaDecoderDialog(QDialog):
         self.status_label.setText(
             self.tr("Done -- {0} candidate(s) found.").format(len(hits))
         )
-        blocks = []
-        for h in hits:
-            id_result = identify.identify(
+
+        self._hits = hits
+        self._id_results = [
+            identify.identify(
                 h["payload"], sf=sf, bw=bw,
                 decode_confidence=h["confidence"], payload_truncated=h["payload_truncated"],
             )
-            truncated_note = (
-                f" [TRUNCATED at symbol {h['truncated_at_symbol']} -- signal collapsed mid-payload]"
-                if h["payload_truncated"] else ""
-            )
-            blocks.append(
-                f"--- t={h['chunk_offset_samples'] / float(self.signal.sample_rate):.1f}s "
-                f"(chunk {h['chunk_idx']}, n_preamble={h['n_preamble']}, "
-                f"sync=0x{h['sync_word']:02X}, confidence={h['confidence']:.0%}){truncated_note} ---\n"
-                + self._format_result(h, id_result)
-            )
-        self.result_view.setPlainText("\n\n".join(blocks))
+            for h in hits
+        ]
+        self._populate_hits_table()
+        if hits:
+            self.hits_table.selectRow(0)
+
+    def _populate_hits_table(self):
+        self.hits_table.setRowCount(len(self._hits))
+        for row, (h, id_result) in enumerate(zip(self._hits, self._id_results)):
+            time_s = h["chunk_offset_samples"] / float(self.signal.sample_rate)
+            payload: bytes = h["payload"]
+            preview = payload[:8].hex(" ")
+            if len(payload) > 8:
+                preview += "..."
+
+            values = [
+                f"{time_s:.1f}s",
+                f"{h['confidence']:.0%}",
+                "yes" if h["sync_ok"] else "no",
+                id_result.protocol,
+                f"4/{4 + h['cr']}",
+                str(h["uncorrectable_errors"]),
+                f"symbol {h['truncated_at_symbol']}" if h["payload_truncated"] else "",
+                preview if preview else "(empty)",
+            ]
+            for col, value in enumerate(values):
+                self.hits_table.setItem(row, col, QTableWidgetItem(value))
+
+    def _on_hits_table_selection_changed(self):
+        rows = self.hits_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        row = rows[0].row()
+        if row >= len(self._hits):
+            return
+        self.detail_view.setPlainText(
+            self._format_result(self._hits[row], self._id_results[row])
+        )
 
     @staticmethod
     def _format_result(result, id_result):
@@ -404,6 +474,14 @@ class LoRaDecoderDialog(QDialog):
             f"Coding rate:    4/{4 + result['cr']}",
             f"Sync word OK:   {result['sync_ok']}",
             f"FEC errors:     {result['uncorrectable_errors']}",
+            f"Confidence:     {result['confidence']:.0%}",
+        ]
+        if result["payload_truncated"]:
+            lines.append(
+                f"Truncated:      yes, at payload symbol {result['truncated_at_symbol']} "
+                f"(signal collapsed mid-payload -- see LORA_PLAN.md)"
+            )
+        lines += [
             "",
             LoRaDecoderDialog._format_identification(id_result),
             "",

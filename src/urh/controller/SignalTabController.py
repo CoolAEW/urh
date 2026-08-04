@@ -15,6 +15,7 @@ class SignalTabController(QWidget):
     signal_created = pyqtSignal(int, Signal)
     files_dropped = pyqtSignal(list)
     frame_was_dropped = pyqtSignal(int, int)
+    lora_decode_requested = pyqtSignal(Signal)
 
     @property
     def num_frames(self):
@@ -132,6 +133,7 @@ class SignalTabController(QWidget):
         signal_frame.frame_dropped.connect(self.frame_dropped)
         signal_frame.files_dropped.connect(self.on_files_dropped)
         signal_frame.closed.connect(self.close_frame)
+        signal_frame.lora_decode_requested.connect(self.lora_decode_requested.emit)
 
     def set_frame_numbers(self):
         for i, f in enumerate(self.signal_frames):

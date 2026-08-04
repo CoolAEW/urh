@@ -57,6 +57,7 @@ class SignalFrame(QFrame):
     signal_drawing_finished = pyqtSignal()
     apply_to_all_clicked = pyqtSignal(Signal)
     sort_action_clicked = pyqtSignal()
+    lora_decode_requested = pyqtSignal(Signal)
 
     @property
     def proto_view(self):
@@ -1317,6 +1318,8 @@ class SignalFrame(QFrame):
         )
         menu.addSeparator()
         auto_detect_action = menu.addAction(self.tr("Auto-Detect signal parameters"))
+        menu.addSeparator()
+        lora_decode_action = menu.addAction(self.tr("LoRa Decode..."))
         action = menu.exec(self.mapToGlobal(event.pos()))
         if action == apply_to_all_action:
             self.setCursor(Qt.CursorShape.WaitCursor)
@@ -1326,6 +1329,8 @@ class SignalFrame(QFrame):
             self.setCursor(Qt.CursorShape.WaitCursor)
             self.signal.auto_detect(detect_modulation=False, detect_noise=False)
             self.unsetCursor()
+        elif action == lora_decode_action:
+            self.lora_decode_requested.emit(self.signal)
 
     def show_modulation_type(self):
         self.ui.cbModulationType.blockSignals(True)

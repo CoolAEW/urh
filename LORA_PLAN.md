@@ -453,4 +453,52 @@ collapse thresholds): the 3-second snippet length and top-K=3 defaults are a
 defensible starting point, not validated against real captures yet -- real
 low-SNR or unusual-preset traffic may need these retuned.
 
-### Phase 4 (table UI + context-menu entry point): not yet started
+### Phase 4: table UI + context-menu entry point -- DONE
+
+**Context-menu entry point**: `SignalFrame` gained a `lora_decode_requested =
+pyqtSignal(Signal)` and a new "LoRa Decode..." action in `contextMenuEvent`
+(right-click a loaded signal), following the exact existing pattern the
+"Auto-Detect signal parameters" action already used. Bubbled up through
+`SignalTabController` by connecting it inside the *shared* private
+`__create_connects_for_signal_frame` helper (already called by both
+`add_signal_frame` and `add_empty_frame`, confirmed by reading both call
+sites) so both signal-construction paths get the wiring from one connection,
+not two. `MainController.on_show_lora_decoder_dialog_action_triggered` (the
+existing File-menu handler) was refactored into a shared
+`open_lora_decoder_dialog(signal)` plus two thin callers: the File-menu slot
+(still defaults to the first loaded signal, preserving old behavior) and a
+new `on_lora_decode_requested(signal)` slot wired to the relayed context-menu
+signal.
+
+**Table UI**: `LoRaDecoderDialog.result_view` (a single `QPlainTextEdit`
+dumping every hit as concatenated text) replaced with `hits_table`
+(`QTableWidget`, one row per scan hit: Time, Confidence, Sync OK, Protocol,
+CR, FEC errors, Truncated, Payload preview -- sorted by confidence descending,
+same as before) plus a `detail_view` (`QPlainTextEdit`, unchanged formatting
+via `_format_result`/`_format_identification`) below it showing the full
+hex/ASCII/identification breakdown for whichever row is selected (auto-
+selects the top row after a scan). Styling (`setAlternatingRowColors`,
+header resize behavior) mirrors `tableWidgetPreview` in `ui_csv_wizard.py`,
+the closest existing lightweight `QTableWidget` reference in the codebase --
+deliberately not the heavier `QAbstractTableModel`/`TableView.py`/
+`LabelValueTableModel` machinery built around `ProtocolAnalyzer`, per the
+resolved lighter-touch-integration decision. Auto-detect's summary now also
+goes to `detail_view` (it isn't a scan-hit list, so it doesn't populate the
+table).
+
+Smoke-tested end-to-end through real Qt: constructed `MainController`,
+confirmed the `SignalTabController -> MainController` signal relay is wired
+(`receivers() > 0`), and directly drove `on_lora_decode_requested` with a
+synthetic `Signal` to confirm the dialog opens without error via that path.
+Separately drove the dialog's own `on_decode_clicked` through the real event
+loop and confirmed the table populates with correct per-column values, a row
+auto-selects, and the detail pane updates to match.
+
+No new automated tests for this phase (pure UI wiring; the project has no Qt
+test harness beyond the manual/smoke-test pattern already used for the
+dialog's earlier stages -- `pytest-qt` isn't installed, `unittest`-only).
+71/71 existing tests still pass unmodified.
+
+## All four planned phases (robustness, performance, auto-detect, UI) are
+now complete. See `~/.claude/plans/soft-skipping-rain.md` for the original
+approved plan this section implements.
