@@ -502,3 +502,57 @@ dialog's earlier stages -- `pytest-qt` isn't installed, `unittest`-only).
 ## All four planned phases (robustness, performance, auto-detect, UI) are
 now complete. See `~/.claude/plans/soft-skipping-rain.md` for the original
 approved plan this section implements.
+
+## Sync-word breakthrough (2026-08-05) -- root cause of "never identifies anything"
+
+User reported the decoder couldn't identify signal type on real captures.
+Root-caused to two compounding bugs, neither of which synthetic tests could
+ever catch (both sides of the modulator/demodulator shared the same wrong
+assumptions, so round-trip tests stayed self-consistently green throughout):
+
+1. **Wrong sync-word symbol formula.** Earlier this session, the sync-word
+   nibble shift was "fixed" from a hardcoded `*8` to `2**(sf-4)`, reasoning
+   from symbol-space proportions. That reasoning was wrong. Reverted to the
+   fixed `*8` shift -- confirmed against a real MeshCore capture using its
+   *actual* sync word (see #3 below): the fixed shift produced an **exact**
+   symbol match (`[8, 16]` observed, `[8, 16]` expected, bit-for-bit) against
+   real hardware. The SF-scaled version never matched anything except by
+   coincidence at SF7.
+
+2. **Exact-equality sync check.** `sync_ok` compared demodulated symbols to
+   the expected value with `==`. A real captured symbol carries residual
+   CFO/timing noise and essentially never lands on the exact expected bin,
+   so this check failed 100% of the time regardless of whether the sync word
+   guess was even correct. Changed to nearest-nibble comparison (same
+   principle `demod_symbol`'s own `argmax` already uses elsewhere).
+
+3. **Sync words were never verified against primary source.** All session,
+   0x34/0x12 (generic LoRaWAN public/private defaults) were used as guesses.
+   Checked GitHub source directly (`gh search code`) instead:
+   - Meshtastic: `const uint8_t syncWord = 0x2b;` --
+     `meshtastic/firmware`, `src/mesh/RadioLibInterface.h`.
+   - MeshCore: uses RadioLib's `RADIOLIB_SX126X_SYNC_WORD_PRIVATE` (= `0x12`,
+     confirmed in `jgromes/RadioLib`) via various `target.cpp` board files in
+     `meshcore-dev/MeshCore`.
+   Both are now named constants (`MESHTASTIC_SYNC_WORD`, `MESHCORE_SYNC_WORD`)
+   in `lora_frame_format.py`. Notably, 0x12 (MeshCore's real value) was
+   already one of the two guesses being tried all along -- it just could
+   never match because of bugs #1 and #2 above.
+
+**Result**, re-scanning all 9 accumulated real captures with the fix:
+`sync_ok=True` now fires on 10/144 hits (0/144 before, all session). Best
+hit (t=167.5s in a 5-minute capture, 1 uncorrectable error on a 49-byte
+payload): confidence 0.28 -> 0.93, and `identify()` flips from `unknown`
+to `meshcore` at 69% confidence. This is the direct fix for the reported
+"can't identify signal type" complaint. Full suite: 71/71 still pass.
+
+**New lead, not yet resolved:** two of the highest-confidence `sync_ok=True`
+hits (t=167.5s and t=42.5s in the same capture) both show implausibly large
+`hash_count` values (16 and 24 hops) in the MeshCore path-length byte
+specifically -- both otherwise decode cleanly (1-3 errors) and now pass
+sync validation, but `meshcore.parse()` fails on the path length being
+inconsistent with the remaining payload size. Worth investigating whether
+this is a residual decode issue concentrated in that specific byte position,
+or a real protocol detail not yet understood (e.g. a different path
+encoding for TRANSPORT_DIRECT routes specifically -- both anomalous hits
+have `route_type=3`).
