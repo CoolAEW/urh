@@ -16,6 +16,29 @@ SFD_SYMBOLS = 2.25
 HEADER_CR = 4
 HEADER_SHIFT_BITS = 2  # header uses sf-2 effective bits; shift left by 2 to place in full sf-bit symbol space
 
+# Each sync-word nibble is shifted by this fixed amount regardless of SF when
+# placed into a chirp symbol (see lora_modulator.build_frame /
+# lora_demod._decode_located_frame). An SF-scaled shift (2**(sf-4)) was tried
+# first and seemed more principled, but didn't match any real capture at
+# all; the fixed *8 shift produced an *exact* symbol match against a real
+# MeshCore frame using its confirmed real sync word (see MESHCORE_SYNC_WORD
+# below) -- real hardware's sync-word detection apparently uses a fixed
+# shift independent of SF.
+SYNC_WORD_SHIFT = 8
+
+# Real sync words, pulled from primary source rather than assumed -- prior
+# guesses in this codebase (the generic LoRaWAN public/private defaults,
+# 0x34/0x12) happened to include the right MeshCore value but a still-wrong
+# comparison formula (see SYNC_WORD_SHIFT above) meant it never actually
+# matched anything until both were fixed together.
+#   Meshtastic: `const uint8_t syncWord = 0x2b;` in
+#     meshtastic/firmware, src/mesh/RadioLibInterface.h
+#   MeshCore: uses RadioLib's RADIOLIB_SX126X_SYNC_WORD_PRIVATE (0x12,
+#     jgromes/RadioLib, e.g. src/modules/SX126x/SX1262.h) via
+#     meshcore-dev/MeshCore's various target.cpp board files.
+MESHTASTIC_SYNC_WORD = 0x2B
+MESHCORE_SYNC_WORD = 0x12
+
 # Standard LoRa bandwidths (Semtech SX127x/SX126x). Shared between
 # LoRaDecoderDialog (manual selection) and lora_autodetect (search space)
 # so there's one list, not two drifting copies.

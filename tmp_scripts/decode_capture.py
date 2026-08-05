@@ -24,7 +24,7 @@ _FORMATS = {
 }
 
 
-def scan(path, sf, bw, fs, n_preamble_options=(8, 16), sync_word_options=(0x34, 0x12),
+def scan(path, sf, bw, fs, n_preamble_options=(8, 16), sync_word_options=(0x34, 0x12, 0x01),
          chunk_sec=3.0, overlap_sec=0.5, sample_format="int16"):
     dtype, item_bytes, to_complex = _FORMATS[sample_format]
     itemsize = 2 * item_bytes  # one I + one Q sample per IQ pair

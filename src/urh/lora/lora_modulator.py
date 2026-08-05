@@ -14,6 +14,7 @@ from urh.lora.lora_frame_format import (
     SFD_SYMBOLS,
     HEADER_CR,
     HEADER_SHIFT_BITS,
+    SYNC_WORD_SHIFT,
 )
 
 
@@ -83,12 +84,18 @@ def build_frame(
     for _ in range(n_preamble):
         parts.append(up0)
 
-    # Sync word: 2 upchirps, each nibble placed in the top 4 bits of the
-    # SF-bit symbol space, i.e. shifted by 2**(sf-4) -- NOT a fixed *8
-    # (that's only correct at SF=7, where 2**(7-4) == 8).
-    sync_shift = 1 << (sf - 4)
-    sync_hi = ((sync_word >> 4) & 0xF) * sync_shift
-    sync_lo = (sync_word & 0xF) * sync_shift
+    # Sync word: 2 upchirps, each nibble shifted by a FIXED *8 regardless of
+    # SF. An earlier version of this code scaled the shift by 2**(sf-4)
+    # (reasoning from symbol-space proportions rather than a verified
+    # reference), which seemed principled but was wrong -- confirmed
+    # against real MeshCore traffic (SF8) using the actual sync word
+    # (0x12, from RadioLib's RADIOLIB_SX126X_SYNC_WORD_PRIVATE, which
+    # MeshCore's firmware uses): the fixed *8 shift produced an *exact*
+    # symbol match against a real captured frame, while the SF-scaled
+    # version did not match at all. Real hardware's sync-word detection
+    # apparently really does use a fixed shift independent of SF.
+    sync_hi = ((sync_word >> 4) & 0xF) * SYNC_WORD_SHIFT
+    sync_lo = (sync_word & 0xF) * SYNC_WORD_SHIFT
     parts.append(chirp.chirp_symbol(sync_hi, sf, bw, fs, downchirp=False))
     parts.append(chirp.chirp_symbol(sync_lo, sf, bw, fs, downchirp=False))
 

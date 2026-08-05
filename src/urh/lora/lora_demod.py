@@ -12,6 +12,7 @@ from urh.lora.lora_frame_format import (
     SFD_SYMBOLS,
     HEADER_CR,
     HEADER_SHIFT_BITS,
+    SYNC_WORD_SHIFT,
 )
 
 
@@ -417,11 +418,20 @@ def _decode_located_frame(iq, sf, bw, fs, preamble_start, header_start, n_preamb
     n_sym = chirp.samples_per_symbol(sf, bw, fs)
     sync_offset = preamble_start + n_preamble * n_sym
     sync_syms, _, _ = _demod_symbols(iq, sync_offset, 2, sf, bw, fs)
-    # See lora_modulator.build_frame: nibble shift is 2**(sf-4), not a fixed
-    # *8 (only correct at SF=7).
-    sync_shift = 1 << (sf - 4)
-    expected_sync = [((sync_word >> 4) & 0xF) * sync_shift, (sync_word & 0xF) * sync_shift]
-    sync_ok = sync_syms == expected_sync
+    # See lora_modulator.build_frame: nibble shift is a fixed *8 regardless
+    # of SF (confirmed against real MeshCore traffic with its real sync
+    # word, 0x12 -- an SF-scaled shift was tried first and didn't match
+    # real captures at all).
+    #
+    # Compare by *nearest nibble*, not exact bin equality: a real captured
+    # symbol carries residual CFO/timing noise and can land a bin or two
+    # off the mathematically exact expected bin. This mirrors how every
+    # other symbol decision in this module already works (demod_symbol
+    # picks the nearest bin via argmax); the sync word is just a
+    # coarser-resolution version of the same decision.
+    observed_nibbles = [int(round(s / SYNC_WORD_SHIFT)) % 16 for s in sync_syms]
+    expected_nibbles = [(sync_word >> 4) & 0xF, sync_word & 0xF]
+    sync_ok = observed_nibbles == expected_nibbles
 
     # header: sf-2 effective bits, always CR 4/8
     ppm_hdr = sf - 2
