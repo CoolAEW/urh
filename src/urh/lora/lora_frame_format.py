@@ -57,3 +57,28 @@ STANDARD_BANDWIDTHS = [
 
 # Spreading factors 7-12 are the full standard LoRa range.
 STANDARD_SPREADING_FACTORS = tuple(range(7, 13))
+
+# Named quick-select presets for LoRaDecoderDialog: (label, sf, bw_hz, cr,
+# n_preamble, sync_word). `cr` is informational only -- decode_frame reads
+# the real coding rate from the frame header -- but included so the field
+# shows something sensible. SF/BW pairs mirror
+# urh.lora.protocols.identify.MESHTASTIC_PRESETS (kept as a separate table
+# rather than importing it: that dict is keyed by (sf, bw) for confidence
+# scoring, this is a full parameter tuple for filling in decoder fields, and
+# the two data shapes don't share enough to be worth coupling the modules
+# over). n_preamble=16 for both: confirmed for Meshtastic from firmware
+# research, and empirically confirmed for MeshCore against a real capture
+# (2026-08-05 -- the first real capture all session to get sync_ok=True
+# used n_preamble=16, not the LoRa-standard default of 8).
+LORA_PRESETS = [
+    ("Meshtastic - ShortTurbo (SF7/BW500k)", 7, 500000, 1, 16, MESHTASTIC_SYNC_WORD),
+    ("Meshtastic - ShortFast (SF7/BW250k)", 7, 250000, 1, 16, MESHTASTIC_SYNC_WORD),
+    ("Meshtastic - ShortSlow (SF8/BW250k)", 8, 250000, 1, 16, MESHTASTIC_SYNC_WORD),
+    ("Meshtastic - MediumFast (SF9/BW250k)", 9, 250000, 1, 16, MESHTASTIC_SYNC_WORD),
+    ("Meshtastic - MediumSlow (SF10/BW250k)", 10, 250000, 1, 16, MESHTASTIC_SYNC_WORD),
+    ("Meshtastic - LongTurbo (SF11/BW500k)", 11, 500000, 4, 16, MESHTASTIC_SYNC_WORD),
+    ("Meshtastic - LongFast (SF11/BW250k, default)", 11, 250000, 1, 16, MESHTASTIC_SYNC_WORD),
+    ("Meshtastic - LongModerate (SF11/BW125k)", 11, 125000, 4, 16, MESHTASTIC_SYNC_WORD),
+    ("Meshtastic - LongSlow (SF12/BW125k, deprecated)", 12, 125000, 4, 16, MESHTASTIC_SYNC_WORD),
+    ("MeshCore - EU868 Default (SF8/BW62.5k)", 8, 62500, 4, 16, MESHCORE_SYNC_WORD),
+]

@@ -37,7 +37,12 @@ from PyQt6.QtWidgets import (
 
 from urh.lora import lora_autodetect
 from urh.lora.lora_demod import scan_for_frames
-from urh.lora.lora_frame_format import DEFAULT_N_PREAMBLE, DEFAULT_SYNC_WORD, STANDARD_BANDWIDTHS
+from urh.lora.lora_frame_format import (
+    DEFAULT_N_PREAMBLE,
+    DEFAULT_SYNC_WORD,
+    LORA_PRESETS,
+    STANDARD_BANDWIDTHS,
+)
 from urh.lora.protocols import identify
 from urh.signalprocessing.Signal import Signal
 
@@ -126,6 +131,16 @@ class LoRaDecoderDialog(QDialog):
         self.setMinimumWidth(640)
         self.resize(760, 560)
 
+        self.preset_combobox = QComboBox(self)
+        self.preset_combobox.addItem(self.tr("Custom"))
+        for label, _, _, _, _, _ in LORA_PRESETS:
+            self.preset_combobox.addItem(label)
+        self.preset_combobox.setToolTip(
+            self.tr("Fills in SF/bandwidth/preamble/sync word below for a known "
+                    "protocol preset. Choose 'Custom' to set them by hand.")
+        )
+        self.preset_combobox.currentIndexChanged.connect(self.on_preset_changed)
+
         self.sf_spinbox = QSpinBox(self)
         self.sf_spinbox.setRange(7, 12)
         self.sf_spinbox.setValue(7)
@@ -157,6 +172,7 @@ class LoRaDecoderDialog(QDialog):
         self._update_sample_rate_label()
 
         form = QFormLayout()
+        form.addRow(self.tr("Preset:"), self.preset_combobox)
         form.addRow(self.tr("Spreading factor (SF):"), self.sf_spinbox)
         form.addRow(self.tr("Bandwidth:"), self.bw_combobox)
         form.addRow(self.tr("Coding rate:"), self.cr_combobox)
@@ -278,6 +294,16 @@ class LoRaDecoderDialog(QDialog):
         if self.worker is not None:
             self.status_label.setText(self.tr("Cancelling..."))
             self.worker.request_stop()
+
+    def on_preset_changed(self, index):
+        if index == 0:  # "Custom" -- leave whatever's there alone
+            return
+        _label, sf, bw, cr, n_preamble, sync_word = LORA_PRESETS[index - 1]
+        self.sf_spinbox.setValue(sf)
+        self.bw_combobox.setCurrentIndex([b for _, b in self.BANDWIDTHS].index(bw))
+        self.cr_combobox.setCurrentIndex(cr - 1)
+        self.n_preamble_spinbox.setValue(n_preamble)
+        self.sync_word_edit.setText(f"0x{sync_word:02X}")
 
     def on_autodetect_clicked(self):
         if self.signal is None:
