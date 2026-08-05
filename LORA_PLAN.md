@@ -556,3 +556,52 @@ this is a residual decode issue concentrated in that specific byte position,
 or a real protocol detail not yet understood (e.g. a different path
 encoding for TRANSPORT_DIRECT routes specifically -- both anomalous hits
 have `route_type=3`).
+
+## Presets, and an ADVERT hunt that didn't land (2026-08-05, session wrap-up)
+
+Added a "Preset" quick-select dropdown to `LoRaDecoderDialog` (commit
+`4c82b887`): 9 Meshtastic modem presets + MeshCore's EU868 default, using
+`LORA_PRESETS` in `lora_frame_format.py` (sf/bw/cr/n_preamble/sync_word per
+entry). Picking one fills in all the manual fields at once instead of
+requiring the user to know/enter them by hand.
+
+Then tried, live, to specifically capture and decode a MeshCore ADVERT
+packet (the self-authenticating type with node name/pubkey/signature) --
+none of the 10 confirmed real `sync_ok=True` hits so far are ADVERT type
+(payload types seen: TXT_MSG, ACK, GRP_TXT, MULTIPART, TRACE). Three
+targeted attempts, none landed cleanly:
+1. User sent multiple zero-hop + flood adverts in one window -- real energy
+   present for ~30s but scattered/broadband, no clean matched-filter lock.
+   Leading hypothesis: flood routing causes multiple nearby nodes to
+   rebroadcast near-simultaneously, colliding at the RF level (not
+   something the decoder can fix).
+2. Single zero-hop advert only, gain=125 (0.87dB less than the previous
+   attempt) -- energy scattered across many separate ~1s windows rather
+   than one clean burst, zero hits.
+3. Single zero-hop advert, gain=0 (user's own proven-successful setting
+   from their independent GUI recordings, notably lower than the gain=125
+   this session's own capture script had been defaulting to all along) --
+   only a brief, weak energy blip (0.072 vs 0.017 background, ~4x -- likely
+   too weak/short to clear the matched filter's noise-floor gate), zero
+   hits.
+
+**Not yet resolved**: whether this is send/record timing lag (the
+back-and-forth between telling the user to send and the recording already
+being live), genuine signal weakness at lower gain, or something
+ADVERT-specific. `tmp_scripts/show_latest_run.py` (committed) is a working,
+OOM-safe example of loading a real capture + opening the dialog +
+exercising the preset dropdown through its real Qt code path -- useful
+starting point for the next attempt, and documents a real gotcha (calling
+`MainController.add_signal()` on a multi-hundred-MB raw capture OOM-killed
+this 7.5GB-RAM machine by running URH's native wavelet-based auto-detect
+over the whole array; load the signal directly and skip `add_signal()` for
+large LoRa captures).
+
+**Next steps when resuming**: (a) try a longer passive capture (10+ min,
+no manual trigger) to catch an ADVERT on its own periodic schedule instead
+of racing live send timing; (b) resolve the path-length/hash_count anomaly
+noted above, which affects two of our best non-ADVERT hits too; (c) revisit
+gain choice systematically (a short sweep across a few gain values against
+the same known-good send, rather than one-shot guesses) now that we know
+the user's own successful captures used much lower gain than this
+session's scripts had been defaulting to.
